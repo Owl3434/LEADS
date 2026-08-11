@@ -1,0 +1,118 @@
+"""
+python decoder_byte.py -i encoded.bytes -o output_dir/
+"""
+
+import argparse
+import lzma
+import struct
+import os
+from pathlib import Path
+
+
+def parse_metadata(data: bytes) -> tuple[list[tuple[str, int]], int]:
+    """
+    解析元数据，返回 [(文件名, 原始长度), ...] 和元数据总字节数
+    """
+    offset = 0
+    
+    # 文件数
+    file_count = struct.unpack_from('<H', data, offset)[0]
+    offset += 2
+    
+    files = []
+    for _ in range(file_count):
+        # 文件名长度
+        fname_len = struct.unpack_from('<B', data, offset)[0]
+        offset += 1
+        
+        # 文件名
+        fname = data[offset:offset + fname_len].decode('utf-8')
+        offset += fname_len
+        
+        # 原始数据长度
+        fsize = struct.unpack_from('<I', data, offset)[0]
+        offset += 4
+        
+        files.append((fname, fsize))
+    
+    return files, offset
+
+
+def decode(input_file: str, output_dir: str):
+    """
+    解码流程:
+    1. 读取合并的lzma文件
+    2. 逐块解压lzma流
+    3. 解析元数据
+    4. 按长度切分并恢复各文件
+    """
+    # 确保输出目录存在
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # 读取输入文件
+    with open(input_file, 'rb') as f:
+        compressed_data = f.read()
+    
+    print(f"读取: {input_file} ({len(compressed_data)} bytes)")
+    
+    # 解压整个流
+    # lzma.decompress 只解压第一个块
+    # 需要用 LZMADecompressor 循环解压所有块
+    decompressed = b''
+    remaining = compressed_data
+    
+    while remaining:
+        decompressor = lzma.LZMADecompressor()
+        try:
+            chunk = decompressor.decompress(remaining)
+            decompressed += chunk
+            remaining = decompressor.unused_data
+        except lzma.LZMAError:
+            break
+    
+    print(f"解压后: {len(decompressed)} bytes")
+    
+    # 解析元数据
+    files_info, meta_size = parse_metadata(decompressed)
+    print(f"元数据: {meta_size} bytes, {len(files_info)} 个文件")
+    
+    # 切分并恢复文件
+    offset = meta_size
+    for fname, fsize in files_info:
+        file_data = decompressed[offset:offset + fsize]
+        offset += fsize
+        
+        output_path = os.path.join(output_dir, fname)
+        with open(output_path, 'wb') as f:
+            f.write(file_data)
+        
+        print(f"  恢复: {fname} ({fsize} bytes)")
+    
+    print(f"\n完成! 文件已恢复到: {output_dir}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='DNA存储文件解码器 - 从lzma/bytes恢复原始文件',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='示例: python decoder_byte.py -i encoded.bytes -o restored/'
+    )
+    parser.add_argument(
+        '-i', '--input',
+        required=True,
+        metavar='FILE',
+        help='输入的lzma/bytes文件'
+    )
+    parser.add_argument(
+        '-o', '--output',
+        default='decoded',
+        metavar='DIR',
+        help='输出目录 (默认: decoded/)'
+    )
+    
+    args = parser.parse_args()
+    decode(args.input, args.output)
+
+
+if __name__ == '__main__':
+    main()
