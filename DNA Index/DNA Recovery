@@ -1,0 +1,1453 @@
+"""
+恢复层与评估层严格分离:
+  - 恢复层 (不看总表): 输出主导库中所有 K 阈值通过的 (bid, iid, payload)
+  - 评估层 (需 --oligo-table): 用总表统计未恢复 + 错误进入两类事件,
+    Step 5 给 v3 风格的详细分类表 (Main/Meta-A/Meta-B + Coredata/Metadata 细分)
+
+默认配置:
+  --max-block-id 200    block_id 上限, 防 1bp 纠错过度
+  --min-coverage 2      4 元组多数投票阈值, K 越大越严格
+  无 CAPMB              彻底删除 consensus / 翻转枚举
+  无聚类                只用 4 元组完全相同的 read 计数
+
+两步流程:
+  Step 1: PEAR 对 PE reads 做重叠合并
+  Step 2: 滑窗找 (bid, iid) + primer 归属 + hash 校验,
+          按 (bid, iid, primer_id) 桶 + 4 元组分组计数
+  Step 3: 选主导库, 应用 K 阈值, 输出 final 产物
+  Step 4: 评估 (错误进入两类)
+  Step 5: 按数据类型分类 (Main/Meta-A/Meta-B/Other + Coredata/Metadata 细分)
+
+依赖:
+  - PEAR (conda install -c bioconda pear)
+  - Python 3.6+
+
+用法:
+  # 完整流程 (自动调用 PEAR)
+  python dna_recovery_pear.py \\
+      -r1 sample_R1.fq.gz -r2 sample_R2.fq.gz \\
+      --seed 20241222 --num-indices 500 \\
+      -o recovery_output
+
+  # 如果已经合并好了, 直接从 merged FASTQ 开始
+  python dna_recovery_pear.py \\
+      --merged merged.fastq \\
+      --seed 20241222 --num-indices 500 \\
+      -o recovery_output
+
+Oligo 结构 (190 nt):
+  [FwdPrimer 20][Block ID 9][InBlock ID 9][Payload 124][Hash 8][RevPrimer 20]
+"""
+
+import argparse
+import gzip
+import subprocess
+import sys
+import os
+import csv
+import random
+import shutil
+from collections import defaultdict, Counter
+from itertools import product as itertools_product
+from typing import List, Tuple, Optional, Dict
+
+
+# =============================================================================
+# 常量 (与 encoder 一致)
+# =============================================================================
+INDEX_LENGTH = 9
+PAYLOAD_LENGTH = 124
+HASH_LENGTH = 8
+PRIMER_LENGTH = 20
+OLIGO_LENGTH = 190
+
+BASES = ['A', 'T', 'G', 'C']
+MIN_GC = 0.40
+MAX_GC = 0.60
+OPTIMAL_GC = 0.50
+MAX_HOMOPOLYMER = 3
+MIN_HAMMING_DISTANCE = 3
+DEFAULT_SEED = 20241222
+
+# Oligo 字段在序列上的绝对位置 (从 Block ID 锚点推算)
+POS_BLOCK_ID   = (20, 29)
+POS_INBLOCK_ID = (29, 38)
+POS_PAYLOAD    = (38, 162)
+POS_HASH       = (162, 170)
+
+
+# =============================================================================
+# 基础函数 (与 encoder 一致)
+# =============================================================================
+
+def gc_content(seq):
+    if len(seq) == 0:
+        return 0
+    return sum(1 for b in seq if b in 'GC') / len(seq)
+
+def gc_score(seq):
+    return 1.0 - abs(gc_content(seq) - OPTIMAL_GC) * 2
+
+def has_homopolymer(seq, max_len):
+    for base in BASES:
+        if base * (max_len + 1) in seq:
+            return True
+    return False
+
+def count_max_homopolymer(seq):
+    if len(seq) == 0:
+        return 0
+    max_len = current = 1
+    for i in range(1, len(seq)):
+        if seq[i] == seq[i-1]:
+            current += 1
+            max_len = max(max_len, current)
+        else:
+            current = 1
+    return max_len
+
+def hamming_distance(seq1, seq2):
+    return sum(c1 != c2 for c1, c2 in zip(seq1, seq2))
+
+
+# =============================================================================
+# Primer 归属 (v3 新增)
+# =============================================================================
+
+PRIMER_TAIL_N = 10  # 锚点前用多少 bp 与 primer 尾部比对
+
+def compute_primer_tails(primers, n=PRIMER_TAIL_N):
+    """
+    取每个 primer 的尾部 n bp.
+    打印 primer 之间各种长度尾部的最小 hamming, 给出可区分性提示.
+    """
+    tails = [p[-n:] for p in primers]
+    if len(primers) >= 2:
+        print(f"\n[Primer 归属设置] N = {n} bp (锚点前)")
+        for i, p in enumerate(primers):
+            print(f"  primer #{i}: {p}   (尾 {n}bp: {p[-n:]})")
+        # 打印两两 hamming
+        print(f"  两两 hamming (尾 {n}bp):")
+        min_d = n
+        for i in range(len(primers)):
+            for j in range(i+1, len(primers)):
+                d = hamming_distance(tails[i], tails[j])
+                print(f"    #{i} vs #{j}: {d}")
+                min_d = min(min_d, d)
+        print(f"  最小 hamming: {min_d}  "
+              f"(原则上 >=3 即可区分, 越大越稳)")
+        if min_d < 3:
+            print(f" 警告: 最小 hamming < 3, primer 区分性较差")
+    return tails
+
+
+def assign_primer_id(seq, anchor_pos, primer_tails, n=PRIMER_TAIL_N):
+    """
+    基于锚点前 N bp 与 primer 尾部的 hamming 距离,
+    返回最近邻的 primer_id (0..len(primer_tails)-1).
+
+    规则 (按用户确认):
+      - 永远归属一个 primer (前引物必然来自这三个之一, 选最相似的)
+      - 不足 N bp 时按可比部分选最近邻
+      - 锚点 P=0 (实在没法比) 退化为 primer_id=0
+    """
+    n_avail = min(anchor_pos, n)
+    if n_avail <= 0:
+        return 0  # 没法比, 默认归到第一个 (极少发生)
+    obs = seq[anchor_pos - n_avail : anchor_pos]
+    # 与每个 primer 的尾部 n_avail bp 比对
+    distances = [hamming_distance(obs, t[-n_avail:]) for t in primer_tails]
+    # 最小距离的 index (有并列时取最小 index)
+    return min(range(len(distances)), key=lambda i: distances[i])
+
+
+def reverse_complement(seq):
+    comp = {'A': 'T', 'T': 'A', 'G': 'C', 'C': 'G', 'N': 'N'}
+    return ''.join(comp.get(b, 'N') for b in reversed(seq))
+
+def is_valid_index(seq):
+    gc = gc_content(seq)
+    return MIN_GC <= gc <= MAX_GC and not has_homopolymer(seq, MAX_HOMOPOLYMER)
+
+def calculate_index_score(seq):
+    return gc_score(seq) * 0.6 + (1.0 - (count_max_homopolymer(seq) - 1) / MAX_HOMOPOLYMER) * 0.4
+
+
+# =============================================================================
+# Index 生成 (与 encoder 完全一致)
+# =============================================================================
+
+def generate_orthogonal_indices(count, seed):
+    random.seed(seed)
+    candidates = []
+    attempts = 0
+    max_attempts = count * 100
+    while len(candidates) < count * 10 and attempts < max_attempts:
+        attempts += 1
+        seq = ''.join(random.choice(BASES) for _ in range(INDEX_LENGTH))
+        if is_valid_index(seq):
+            candidates.append((seq, calculate_index_score(seq)))
+    candidates.sort(key=lambda x: -x[1])
+
+    indices = []
+    for seq, score in candidates:
+        if len(indices) >= count:
+            break
+        if not indices:
+            min_dist = INDEX_LENGTH
+        else:
+            min_dist = min(
+                min(hamming_distance(seq, e) for e in indices),
+                min(hamming_distance(seq, reverse_complement(e)) for e in indices)
+            )
+        if min_dist >= MIN_HAMMING_DISTANCE:
+            indices.append(seq)
+    return indices
+
+
+# =============================================================================
+# Hash (与 encoder 完全一致)
+# =============================================================================
+
+def generate_valid_hash_codebook(length=8):
+    valid = []
+    for t in itertools_product(BASES, repeat=length):
+        s = ''.join(t)
+        gc = gc_content(s)
+        if gc < MIN_GC or gc > MAX_GC:
+            continue
+        if has_homopolymer(s, MAX_HOMOPOLYMER):
+            continue
+        if s[0] == s[1] or s[-1] == s[-2]:
+            continue
+        valid.append(s)
+    return sorted(valid)
+
+HASH_CODEBOOK = generate_valid_hash_codebook(HASH_LENGTH)
+HASH_CODEBOOK_SIZE = len(HASH_CODEBOOK)
+
+def fnv1a_hash_dna(data):
+    FNV_PRIME = 0x01000193
+    FNV_OFFSET = 0x811c9dc5
+    h = FNV_OFFSET
+    for c in data:
+        h ^= ord(c)
+        h = (h * FNV_PRIME) & 0xFFFFFFFF
+    return HASH_CODEBOOK[h % HASH_CODEBOOK_SIZE]
+
+
+# =============================================================================
+# Index 纠错查找表
+# =============================================================================
+
+def build_error_correction_table(indices):
+    """
+    预建纠错表: 精确匹配 + 所有 1bp 突变.
+    汉明距离 >= 3 保证 1bp 错误唯一纠错.
+    """
+    table = {}
+    for i, seq in enumerate(indices):
+        table[seq] = (i, 0)
+
+    for i, seq in enumerate(indices):
+        for pos in range(INDEX_LENGTH):
+            for base in BASES:
+                if base == seq[pos]:
+                    continue
+                mutant = seq[:pos] + base + seq[pos+1:]
+                if mutant not in table:
+                    table[mutant] = (i, 1)
+                elif table[mutant][0] != i:
+                    table[mutant] = (-1, -1)  # 歧义
+
+    return {k: v for k, v in table.items() if v[0] >= 0}
+
+
+# =============================================================================
+# Step 1: PEAR 合并
+# =============================================================================
+
+def run_pear_merge(r1_path, r2_path, outdir, min_overlap=80, threads=4):
+    """
+    调用 PEAR 做双端 read 重叠合并.
+
+    PEAR 穷举所有可能的重叠, 用打分矩阵 + 统计检验选最优.
+    不需要预设 fragment size.
+
+    参数:
+      min_overlap: 最小重叠长度 (默认 80, 理论重叠 ~110bp)
+      threads: 并行线程数
+
+    输出:
+      prefix.assembled.fastq   - 合并成功的序列
+      prefix.unassembled.forward.fastq - 未合并的 R1
+      prefix.unassembled.reverse.fastq - 未合并的 R2
+      prefix.discarded.fastq   - 丢弃的
+    """
+    prefix = os.path.join(outdir, 'pear_merge')
+
+    # 检查 PEAR 是否可用
+    if not shutil.which('pear'):
+        print("  错误: pear 未找到!")
+        print("  安装: conda install -c bioconda pear")
+        print("        或从 https://cme.h-its.org/exelixis/web/software/pear/ 下载")
+        sys.exit(1)
+
+    cmd = [
+        'pear',
+        '-f', r1_path,          # forward reads
+        '-r', r2_path,          # reverse reads
+        '-o', prefix,           # 输出前缀
+        '-v', str(min_overlap), # 最小重叠长度
+        '-j', str(threads),     # 线程数
+        '-p', '0.01',           # p-value 阈值 (统计检验)
+    ]
+
+    print(f"  命令: {' '.join(cmd)}")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    if result.returncode != 0:
+        print(f"  PEAR 错误:")
+        print(result.stderr[:1000])
+        sys.exit(1)
+
+    # 打印 PEAR 的摘要输出
+    for line in result.stdout.split('\n'):
+        line = line.strip()
+        if any(kw in line.lower() for kw in ['assembled', 'discarded', 'not assembled']):
+            print(f"  {line}")
+
+    # PEAR 输出文件
+    assembled_path = prefix + '.assembled.fastq'
+    if not os.path.exists(assembled_path):
+        # 有些版本输出 .assembled.fq
+        for ext in ['.assembled.fastq', '.assembled.fq']:
+            candidate = prefix + ext
+            if os.path.exists(candidate):
+                assembled_path = candidate
+                break
+
+    if not os.path.exists(assembled_path):
+        print(f"  错误: 找不到 PEAR 输出文件")
+        print(f"  outdir 内容: {os.listdir(outdir)}")
+        sys.exit(1)
+
+    # 统计合并结果
+    n_merged = 0
+    len_dist = defaultdict(int)
+    with open(assembled_path, 'r') as f:
+        while True:
+            h = f.readline()
+            if not h:
+                break
+            seq = f.readline().strip()
+            f.readline()  # +
+            f.readline()  # qual
+            n_merged += 1
+            len_dist[len(seq)] += 1
+
+    print(f"\n  合并成功: {n_merged:,} 条")
+    print(f"  长度分布 (top 15):")
+    for length, count in sorted(len_dist.items(), key=lambda x: -x[1])[:15]:
+        pct = count / n_merged * 100
+        bar = '#' * int(pct / 2)
+        print(f"    {length:>4}bp: {count:>10,} ({pct:5.1f}%) {bar}")
+
+    # 统计未合并的
+    unasm_fwd = prefix + '.unassembled.forward.fastq'
+    n_unassembled = 0
+    if os.path.exists(unasm_fwd):
+        with open(unasm_fwd, 'r') as f:
+            for line in f:
+                if line.startswith('@'):
+                    n_unassembled += 1
+    print(f"  未合并:   {n_unassembled:,} 对")
+
+    return assembled_path, n_merged
+
+
+# =============================================================================
+# Step 2: Block ID 滑窗搜索
+# =============================================================================
+
+def find_block_ids(seq, ec_table):
+    """
+    在序列上做 9bp 滑窗, 查找连续两个 index (Block ID + InBlock ID).
+    Block ID 在 oligo 位置 20 开始, 所以找到位置 p 意味着:
+      seq[p] 对应 oligo 位置 20
+      seq 的起始 (位置 0) 对应 oligo 位置 20 - p
+
+    返回: (anchor_pos, block_id, inblock_id, block_err, inblock_err) 或 None
+      anchor_pos: seq 中 Block ID 起始位置
+    """
+    if len(seq) < 18:
+        return None
+
+    results = []
+    for p in range(len(seq) - 17):
+        seg1 = seq[p:p+9]
+        seg2 = seq[p+9:p+18]
+
+        if seg1 not in ec_table or seg2 not in ec_table:
+            continue
+
+        bid, berr = ec_table[seg1]
+        iid, ierr = ec_table[seg2]
+        total_err = berr + ierr
+        results.append((total_err, p, bid, iid, berr, ierr))
+
+    if not results:
+        return None
+
+    # 取纠错数最少的; 同分取最靠近理论位置 20 的
+    results.sort(key=lambda x: (x[0], abs(x[1] - 20)))
+    _, anchor, bid, iid, berr, ierr = results[0]
+    return (anchor, bid, iid, berr, ierr)
+
+
+# =============================================================================
+# 字段提取与 Hash 校验
+# =============================================================================
+
+def extract_field(seq, anchor_pos, field_start, field_end):
+    """
+    从序列中提取 oligo 上 [field_start, field_end) 的字段.
+    anchor_pos: seq 中 Block ID 起始位置, 对应 oligo 位置 20.
+    """
+    # seq[anchor_pos] = oligo[20]
+    # seq[i] = oligo[20 + (i - anchor_pos)]
+    # 要取 oligo[field_start] → seq[anchor_pos + (field_start - 20)]
+    seq_start = anchor_pos + (field_start - 20)
+    seq_end = anchor_pos + (field_end - 20)
+
+    if seq_start < 0 or seq_end > len(seq):
+        return None
+
+    field = seq[seq_start:seq_end]
+    if 'N' in field:
+        return None
+    return field
+
+
+def verify_hash(seq, anchor_pos):
+    """提取 Block ID + InBlock ID + Payload, 计算 hash, 与 hash 字段比较."""
+    block_seq = extract_field(seq, anchor_pos, 20, 29)
+    inblock_seq = extract_field(seq, anchor_pos, 29, 38)
+    payload = extract_field(seq, anchor_pos, 38, 162)
+    hash_field = extract_field(seq, anchor_pos, 162, 170)
+
+    if not all([block_seq, inblock_seq, payload, hash_field]):
+        return False, None
+
+    expected = fnv1a_hash_dna(block_seq + inblock_seq + payload)
+    return expected == hash_field, payload
+
+
+# =============================================================================
+# FASTQ 读取
+# =============================================================================
+
+def read_fastq(path):
+    """逐条读取 FASTQ"""
+    open_func = gzip.open if path.endswith('.gz') else open
+    mode = 'rt' if path.endswith('.gz') else 'r'
+    with open_func(path, mode) as f:
+        while True:
+            header = f.readline().strip()
+            if not header:
+                break
+            seq = f.readline().strip()
+            f.readline()  # +
+            qual = f.readline().strip()
+            yield header, seq, qual
+
+
+# =============================================================================
+# 主处理流程
+# =============================================================================
+
+def process_merged_reads(merged_path, indices, ec_table, primer_tails,
+                         max_block_id=100):
+    """
+    v5: 处理合并后的序列, 用 4 元组分组计数.
+      Block ID 搜索 → primer 归属 → hash 校验 → 按 (bid, iid, primer_id) 桶 +
+      4 元组 (read_block, read_inblock, read_payload, read_hash) 分组计数
+
+    返回:
+      stats: 统计字典
+      bucket_counter: dict[(bid, iid, primer_id)] -> Counter({tuple4: count})
+        其中 tuple4 = (read_block, read_inblock, read_payload, read_hash)
+    """
+
+    n_primers = len(primer_tails)
+
+    stats = {
+        'total': 0,
+        'id_found': 0,
+        'id_not_found': 0,
+        'bid_filtered': 0,
+        'hash_pass': 0,
+        'hash_fail': 0,
+        'hash_incomplete': 0,
+        'block_err_dist': Counter(),
+        'inblock_err_dist': Counter(),
+        'seq_len_dist': Counter(),
+        'primer_id_dist': Counter(),
+        'primer_id_dist_hashpass': Counter(),
+        'short_anchor_count': 0,
+    }
+
+    # (bid, iid, primer_id) -> Counter({tuple4: count})
+    bucket_counter = defaultdict(Counter)
+
+    print(f"\n[Step 2] Block ID 滑窗搜索 + primer 归属 + Hash 校验 + 4 元组分组")
+    print(f"  primer_tails: {n_primers} 条")
+    print(f"  max_block_id: {max_block_id}  (bid >= 此值的 reads 直接丢弃)")
+
+    for header, seq, qual in read_fastq(merged_path):
+        stats['total'] += 1
+        stats['seq_len_dist'][len(seq)] += 1
+
+        if stats['total'] % 500000 == 0:
+            print(f"    已处理 {stats['total']:,}, "
+                  f"ID命中 {stats['id_found']:,}, "
+                  f"Hash通过 {stats['hash_pass']:,}, "
+                  f"桶数 {len(bucket_counter):,}")
+
+        # 正向搜索
+        result = find_block_ids(seq, ec_table)
+        if result is None:
+            rc_seq = reverse_complement(seq)
+            result = find_block_ids(rc_seq, ec_table)
+            if result is not None:
+                seq = rc_seq
+
+        if result is None:
+            stats['id_not_found'] += 1
+            continue
+
+        stats['id_found'] += 1
+        anchor_pos, block_id, inblock_id, berr, ierr = result
+
+        if max_block_id is not None and block_id >= max_block_id:
+            stats['bid_filtered'] += 1
+            continue
+
+        stats['block_err_dist'][berr] += 1
+        stats['inblock_err_dist'][ierr] += 1
+
+        if anchor_pos < PRIMER_TAIL_N:
+            stats['short_anchor_count'] += 1
+        primer_id = assign_primer_id(seq, anchor_pos, primer_tails)
+        stats['primer_id_dist'][primer_id] += 1
+
+        # Hash 校验
+        hash_ok, payload = verify_hash(seq, anchor_pos)
+
+        if payload is None:
+            stats['hash_incomplete'] += 1
+            continue
+        if not hash_ok:
+            stats['hash_fail'] += 1
+            continue
+
+        # hash 通过: 提取 4 元组并计数
+        stats['hash_pass'] += 1
+        stats['primer_id_dist_hashpass'][primer_id] += 1
+
+        read_block = seq[anchor_pos : anchor_pos + 9]
+        read_inblock = seq[anchor_pos + 9 : anchor_pos + 18]
+        read_hash = seq[anchor_pos + 142 : anchor_pos + 150]
+        # read_payload 与 verify_hash 提取的一致 (但用 seq 切出确保一致)
+        read_payload = seq[anchor_pos + 18 : anchor_pos + 142]
+
+        key = (block_id, inblock_id, primer_id)
+        tuple4 = (read_block, read_inblock, read_payload, read_hash)
+        bucket_counter[key][tuple4] += 1
+
+    return stats, bucket_counter
+
+# =============================================================================
+# Step 3: 选主导库 + 应用 K 阈值 + 输出 final 产物
+# =============================================================================
+
+def select_dominant_primer(stats, primers):
+    """根据 primer_id 分布选主导库 (reads 数最多的 primer)."""
+    n_primers = len(primers)
+    primer_dist = sorted(
+        [(pid, stats['primer_id_dist'].get(pid, 0)) for pid in range(n_primers)],
+        key=lambda x: -x[1])
+    return primer_dist[0][0], primer_dist
+
+
+def apply_k_threshold(bucket_counter, dominant_pid, K):
+    """
+    在主导库桶上应用 K 阈值, 选 winner.
+
+    对每个 (bid, iid, primer_id == dominant_pid) 桶:
+      取频次最高的 4 元组作为 winner candidate, 频次 = coverage.
+      只接受 coverage >= K 的桶.
+
+    返回:
+      final_payloads: dict[(bid, iid)] -> {
+        'payload': ...,           # winner 的 payload (124bp)
+        'coverage': int,          # winner 4 元组的频次
+        'total_reads': int,       # 该桶所有 hash-pass reads 总数
+        'n_distinct_tuples': int, # 该桶有几个不同的 4 元组
+        'read_block': ..., 'read_inblock': ..., 'read_hash': ...
+      }
+      n_below_k: 因为 coverage < K 被丢弃的桶数
+      n_other_primers_buckets: 非主导库桶数 (统计用)
+    """
+    final_payloads = {}
+    n_below_k = 0
+    n_other_primers_buckets = 0
+    coverage_dist = Counter()  # winner 覆盖度分布
+
+    for key, counter in bucket_counter.items():
+        bid, iid, pid = key
+        if pid != dominant_pid:
+            n_other_primers_buckets += 1
+            continue
+
+        most_common = counter.most_common(1)[0]
+        winner_tuple, coverage = most_common
+        total_reads = sum(counter.values())
+        n_distinct = len(counter)
+
+        coverage_dist[coverage] += 1
+
+        if coverage < K:
+            n_below_k += 1
+            continue
+
+        rb, ri, rp, rh = winner_tuple
+        final_payloads[(bid, iid)] = {
+            'payload': rp,
+            'coverage': coverage,
+            'total_reads': total_reads,
+            'n_distinct_tuples': n_distinct,
+            'read_block': rb,
+            'read_inblock': ri,
+            'read_hash': rh,
+        }
+
+    return final_payloads, n_below_k, n_other_primers_buckets, coverage_dist
+
+
+def write_outputs(outdir, stats, final_payloads, indices, dominant_pid,
+                  primers, K, n_below_k, n_other_primers_buckets, coverage_dist):
+    """
+    v5: 写主导库恢复产物 + 详细报告.
+    """
+    os.makedirs(outdir, exist_ok=True)
+
+    # --- 主报告 ---
+    rpt_path = os.path.join(outdir, 'recovery_report.txt')
+    with open(rpt_path, 'w') as f:
+        f.write("DNA Storage Recovery Report (v5)\n")
+        f.write("4 元组多数投票 + K 阈值过滤 (无聚类, 无 CAPMB)\n")
+        f.write("=" * 60 + "\n\n")
+        f.write(f"合并后序列总数:       {stats['total']:>12,}\n")
+        f.write(f"ID 命中:              {stats['id_found']:>12,} "
+                f"({stats['id_found']/max(stats['total'],1)*100:.1f}%)\n")
+        f.write(f"ID 未命中:            {stats['id_not_found']:>12,}\n")
+        f.write(f"bid 过滤 (>= 100):    {stats.get('bid_filtered',0):>12,}\n")
+        f.write(f"锚点前不足{PRIMER_TAIL_N}bp:    {stats['short_anchor_count']:>12,}\n\n")
+        f.write(f"hash 通过 (单条):     {stats['hash_pass']:>12,}\n")
+        f.write(f"hash 失败:            {stats['hash_fail']:>12,}\n")
+        f.write(f"字段不完整:           {stats['hash_incomplete']:>12,}\n\n")
+
+        f.write("primer_id 分布 (所有 ID 命中 reads, 用于选主导库):\n")
+        n_primers = len(primers)
+        for pid in range(n_primers):
+            cnt = stats['primer_id_dist'].get(pid, 0)
+            cnt_h = stats['primer_id_dist_hashpass'].get(pid, 0)
+            pct = cnt / max(stats['id_found'], 1) * 100
+            mark = "  ← 主导库" if pid == dominant_pid else ""
+            primer_str = primers[pid][:20]
+            f.write(f"  #{pid} ({primer_str}): {cnt:,} ({pct:.1f}%)   "
+                    f"hash 通过 {cnt_h:,}{mark}\n")
+
+        f.write(f"\n--- 主导库 (primer_id={dominant_pid}) ---\n")
+        f.write(f"非主导库桶数 (已丢弃):     {n_other_primers_buckets:>10,}\n")
+        f.write(f"主导库 winner 覆盖度分布:\n")
+        cum = 0
+        cum_below_k = 0
+        for c in sorted(coverage_dist.keys()):
+            cum += coverage_dist[c]
+            mark = "  ← 被 K 阈值丢弃" if c < K else ""
+            if c < K:
+                cum_below_k += coverage_dist[c]
+            f.write(f"    coverage={c:>3}: {coverage_dist[c]:>8,}  累计 {cum:>8,}{mark}\n")
+
+        n_total_buckets = sum(coverage_dist.values())
+        f.write(f"\n  主导库桶总数:         {n_total_buckets:>10,}\n")
+        f.write(f"  K = {K} 阈值丢弃:        {n_below_k:>10,} "
+                f"({n_below_k/max(n_total_buckets,1)*100:.2f}%)\n")
+        f.write(f"  K = {K} 阈值通过:        {len(final_payloads):>10,} "
+                f"({len(final_payloads)/max(n_total_buckets,1)*100:.2f}%)\n")
+
+        f.write(f"\nBlock ID 纠错距离 (主导库 reads):\n")
+        for d in sorted(stats['block_err_dist'].keys()):
+            f.write(f"  距离{d}: {stats['block_err_dist'][d]:,}\n")
+        f.write(f"\nInBlock ID 纠错距离:\n")
+        for d in sorted(stats['inblock_err_dist'].keys()):
+            f.write(f"  距离{d}: {stats['inblock_err_dist'][d]:,}\n")
+
+        f.write(f"\n合并后序列长度分布 (top 15):\n")
+        for length, count in sorted(stats['seq_len_dist'].items(),
+                                     key=lambda x: -x[1])[:15]:
+            f.write(f"  {length}bp: {count:,} "
+                    f"({count/max(stats['total'],1)*100:.1f}%)\n")
+
+    print(f"  报告: {rpt_path}")
+
+    # --- 控制台简要输出 ---
+    n_total_buckets = sum(coverage_dist.values())
+    print(f"\n[Step 3] 应用 K={K} 阈值")
+    print(f"  主导库桶总数:    {n_total_buckets:,}")
+    print(f"  K 阈值丢弃:      {n_below_k:,} (coverage < {K})")
+    print(f"  最终接受:        {len(final_payloads):,}")
+
+    # --- 输出 final payloads (供下游 Raptor-Q) ---
+    payload_path = os.path.join(outdir, 'recovered_payloads.tsv')
+    with open(payload_path, 'w', newline='') as f:
+        w = csv.writer(f, delimiter='\t')
+        w.writerow(['block_id', 'inblock_id', 'global_idx',
+                    'coverage', 'total_reads', 'n_distinct_tuples',
+                    'payload'])
+        for addr in sorted(final_payloads.keys()):
+            bid, iid = addr
+            info = final_payloads[addr]
+            global_idx = bid * len(indices) + iid
+            w.writerow([bid, iid, global_idx,
+                        info['coverage'], info['total_reads'],
+                        info['n_distinct_tuples'], info['payload']])
+    print(f"  Payloads: {payload_path}")
+
+    return len(final_payloads)
+
+
+def load_oligo_table(oligo_csv, primer_fwd, primer_rev):
+    """加载 oligo 总表, 返回目标引物组的序列列表."""
+    print(f"\n[加载参考总表] {oligo_csv}")
+    oligos = []
+    with open(oligo_csv) as f:
+        for row in csv.reader(f):
+            if row:
+                seq = row[0].strip().upper()
+                if seq and len(seq) > 50 and set(seq) <= {'A', 'T', 'G', 'C'}:
+                    oligos.append(seq)
+    print(f"  总行数: {len(oligos):,}")
+
+    # 按引物分组
+    target = []
+    for seq in oligos:
+        if len(seq) >= 40:
+            if seq[:20] == primer_fwd and seq[-20:] == primer_rev:
+                target.append(seq)
+
+    # 去重
+    target_unique = list(dict.fromkeys(target))
+    print(f"  目标引物组: {len(target_unique):,} 条 unique oligos")
+    return target_unique
+
+
+def load_encoder_fasta(fasta_path):
+    """
+    v5.1 新增: 加载 encoder 当年输出的原始 oligos.fasta.
+
+    fasta 文件中每条 oligo 的 header 格式 (encoder 写的):
+      >block{bid}_inblock{iid}_idx{payload_idx}_{type}
+    其中 type ∈ {'main', 'meta_a', 'meta_b'} (默认 'data')
+
+    fasta 文件的写入顺序就是 payload_idx 顺序 (encoder 单调递增).
+
+    返回:
+      list of dict: [{'block_id': int, 'inblock_id': int, 'payload_idx': int,
+                      'type': str, 'oligo': str (190nt)}, ...]
+      列表顺序就是 payload_idx 顺序
+    """
+    import re
+    print(f"\n[加载 encoder fasta] {fasta_path}")
+    entries = []
+
+    header_re = re.compile(
+        r'^>block(\d+)_inblock(\d+)_idx(\d+)_(\w+)')
+
+    with open(fasta_path) as f:
+        cur_header = None
+        cur_seq = []
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith('>'):
+                # commit previous
+                if cur_header is not None:
+                    seq = ''.join(cur_seq).upper()
+                    m = header_re.match(cur_header)
+                    if m:
+                        bid, iid, pidx, ptype = m.groups()
+                        entries.append({
+                            'block_id': int(bid),
+                            'inblock_id': int(iid),
+                            'payload_idx': int(pidx),
+                            'type': ptype,
+                            'oligo': seq,
+                        })
+                cur_header = line
+                cur_seq = []
+            else:
+                cur_seq.append(line)
+        # last
+        if cur_header is not None:
+            seq = ''.join(cur_seq).upper()
+            m = header_re.match(cur_header)
+            if m:
+                bid, iid, pidx, ptype = m.groups()
+                entries.append({
+                    'block_id': int(bid),
+                    'inblock_id': int(iid),
+                    'payload_idx': int(pidx),
+                    'type': ptype,
+                    'oligo': seq,
+                })
+
+    print(f"  共 {len(entries):,} 条")
+    # 类型分布
+    type_counts = Counter(e['type'] for e in entries)
+    for t, c in sorted(type_counts.items()):
+        print(f"    type={t}: {c:,}")
+
+    return entries
+
+
+
+
+# =============================================================================
+# Step 4: 主导库评估 (核心交付: 未恢复 + 错误进入两类统计)
+# =============================================================================
+
+def evaluate_dominant_library(final_payloads, indices, ec_table, ref_entries,
+                               outdir, dominant_pid, primer_label="",
+                               params=None):
+    """
+    v5.1: 评估层. 输入改为 ref_entries (encoder fasta 解析的 list of dict).
+
+    每个 ref_entry 含: block_id, inblock_id, payload_idx, type, oligo (190nt)
+    list 顺序 = encoder 原始输出顺序 = 真实 payload_idx 顺序.
+
+    评估:
+      (1) 未恢复率: 总表里有多少 (bid, iid) 没被恢复出来
+      (2) 错误进入率: 恢复出的中有多少是错的, 分两类:
+          (A) error_addr_not_in_ref: 地址不在主导库总表
+          (B) error_payload_mismatch: 地址在总表但 payload 不一致
+              ★ 最危险, 是 Raptor-Q silent corruption 的来源
+    """
+    print(f"\n[Step 4] 主导库评估  primer_id={dominant_pid}  ({primer_label[:20]})")
+    print(f"  恢复层不知道总表存在; 此处仅统计.")
+
+    # ---- 从 encoder fasta entries 提取 (bid, iid) -> ref_payload + payload_idx + type ----
+    ref_by_addr = {}      # (bid, iid) -> ref_payload (124nt)
+    ref_addr_to_pidx = {} # (bid, iid) -> 真实 payload_idx (来自 fasta header)
+    ref_addr_to_type = {} # (bid, iid) -> 类型 (main/meta_a/meta_b)
+
+    for entry in ref_entries:
+        seq = entry['oligo']
+        if len(seq) < 162:
+            continue
+        bid = entry['block_id']
+        iid = entry['inblock_id']
+        ref_payload = seq[38:162]
+        addr = (bid, iid)
+        if addr not in ref_by_addr:
+            ref_by_addr[addr] = ref_payload
+            ref_addr_to_pidx[addr] = entry['payload_idx']
+            ref_addr_to_type[addr] = entry['type']
+
+    print(f"  encoder fasta entries: {len(ref_entries):,}")
+    print(f"  成功提取地址:         {len(ref_by_addr):,}")
+
+    ref_addrs = set(ref_by_addr.keys())
+
+    # ---- 提取恢复层产物 (v5: 直接从 final_payloads 取) ----
+    recovered = {addr: info['payload'] for addr, info in final_payloads.items()}
+    recovered_addrs = set(recovered.keys())
+
+    print(f"  恢复层产物 (K 阈值通过): {len(recovered_addrs):,}")
+
+    # ---- 评估 (1): 未恢复 ----
+    missing_addrs = ref_addrs - recovered_addrs
+    coverage_pct = (len(ref_addrs) - len(missing_addrs)) / max(len(ref_addrs), 1) * 100
+
+    # ---- 评估 (2): 错误进入 ----
+    n_correct = 0                     # hash ok + 在总表 + payload 一致 (正确恢复)
+    n_err_addr_not_in_ref = 0         # (A) hash ok 但地址不在总表
+    n_err_payload_mismatch = 0        # (B) hash ok 且地址在总表但 payload 不一致
+
+    err_addr_not_in_ref_list = []     # [(bid, iid, payload), ...]
+    err_payload_mismatch_list = []    # [(bid, iid, recovered_payload, ref_payload), ...]
+    correct_list = []                 # [(bid, iid), ...]
+
+    for addr, recov_payload in recovered.items():
+        bid, iid = addr
+        if addr not in ref_addrs:
+            n_err_addr_not_in_ref += 1
+            err_addr_not_in_ref_list.append((bid, iid, recov_payload))
+        else:
+            ref_payload = ref_by_addr[addr]
+            if recov_payload == ref_payload:
+                n_correct += 1
+                correct_list.append(addr)
+            else:
+                n_err_payload_mismatch += 1
+                err_payload_mismatch_list.append((bid, iid, recov_payload, ref_payload))
+
+    n_recovered = len(recovered_addrs)
+    n_total_err = n_err_addr_not_in_ref + n_err_payload_mismatch
+
+    # ---- 打印结果 ----
+    print(f"\n 主导库恢复评估")
+    print(f"  总表大小 (期望恢复):   {len(ref_addrs):>10,}")
+    print(f"  恢复层产物 (hash ok):  {n_recovered:>10,}")
+    print(f"  ─" * 30)
+    print(f"  正确恢复:              {n_correct:>10,} "
+          f"({n_correct/max(len(ref_addrs),1)*100:.2f}% of 总表)")
+    print(f"  未恢复 (总表中无产物): {len(missing_addrs):>10,} "
+          f"({len(missing_addrs)/max(len(ref_addrs),1)*100:.2f}% of 总表)")
+    print(f"  ─" * 30)
+    print(f"   错误进入事件 (恢复出的 hash-ok 中):")
+    print(f"     (A) 地址不在总表:    {n_err_addr_not_in_ref:>10,} "
+          f"({n_err_addr_not_in_ref/max(n_recovered,1)*100:.4f}% of 恢复层)")
+    print(f"     (B) payload 不一致:  {n_err_payload_mismatch:>10,} "
+          f"({n_err_payload_mismatch/max(n_recovered,1)*100:.4f}% of 恢复层)")
+    print(f"     合计错误进入率:      {n_total_err/max(n_recovered,1)*100:.4f}%")
+
+    # ---- 写出评估报告 ----
+    tag = primer_label[:10] if primer_label else f"pid{dominant_pid}"
+    eval_path = os.path.join(outdir, f'evaluation_{tag}.txt')
+    with open(eval_path, 'w') as f:
+        f.write("Dominant Library Evaluation Report\n")
+        f.write(f"primer_id = {dominant_pid}\n")
+        f.write(f"primer    = {primer_label}\n")
+        f.write("=" * 60 + "\n\n")
+        f.write(f"主导库总表大小:        {len(ref_addrs):>10,}\n")
+        f.write(f"恢复层产物 (hash ok):  {n_recovered:>10,}\n\n")
+        f.write(f"--- 与总表比对 ---\n")
+        f.write(f"正确恢复:              {n_correct:>10,} "
+                f"({n_correct/max(len(ref_addrs),1)*100:.2f}%)\n")
+        f.write(f"未恢复:                {len(missing_addrs):>10,} "
+                f"({len(missing_addrs)/max(len(ref_addrs),1)*100:.2f}%)\n\n")
+        f.write(f"--- 错误进入事件 (核心) ---\n")
+        f.write(f"(A) 地址不在总表:      {n_err_addr_not_in_ref:>10,} "
+                f"({n_err_addr_not_in_ref/max(n_recovered,1)*100:.4f}%)\n")
+        f.write(f"(B) payload 不一致:    {n_err_payload_mismatch:>10,} "
+                f"({n_err_payload_mismatch/max(n_recovered,1)*100:.4f}%)\n")
+        f.write(f"    ★ (B) 是最危险的: hash 和 index 都通过但 payload 错了\n")
+        f.write(f"合计错误进入率:        "
+                f"{n_total_err/max(n_recovered,1)*100:.4f}% of 恢复层\n\n")
+
+        # v5.1: 直接用 fasta header 里的 type, 不需要 params 推断
+        # type ∈ {'main', 'meta_a', 'meta_b'}; main 内部进一步用 params 区分 core / meta_in_main
+        coredata_len = int(params.get('coredata_length', 0)) if params else 0
+        payload_len_param = int(params.get('payload_length', 124)) if params else 124
+        coredata_payloads = (coredata_len + payload_len_param - 1) // payload_len_param if coredata_len > 0 else 0
+
+        type_total = Counter()
+        type_correct = Counter()
+        type_missing = Counter()
+        for addr, fasta_type in ref_addr_to_type.items():
+            pidx = ref_addr_to_pidx[addr]
+            # main 进一步细分: core / meta_in_main
+            if fasta_type == 'main':
+                if pidx < coredata_payloads:
+                    t = 'core'
+                else:
+                    t = 'meta_in_main'
+            else:
+                t = fasta_type   # meta_a / meta_b
+
+            type_total[t] += 1
+            if addr in recovered_addrs:
+                if recovered[addr] == ref_by_addr[addr]:
+                    type_correct[t] += 1
+            if addr in missing_addrs:
+                type_missing[t] += 1
+
+        f.write("--- 按数据类型分类 (来自 encoder fasta header) ---\n")
+        f.write(f"  {'类型':<14} {'总数':>8} {'正确恢复':>10} {'未恢复':>8}  比率\n")
+        for t in ['core', 'meta_in_main', 'meta_a', 'meta_b']:
+            if type_total[t] == 0:
+                continue
+            pct = type_correct[t] / max(type_total[t], 1) * 100
+            f.write(f"  {t:<14} {type_total[t]:>8,} {type_correct[t]:>10,} "
+                    f"{type_missing[t]:>8,}  {pct:.2f}%\n")
+        f.write("\n")
+
+    print(f"\n  评估报告: {eval_path}")
+
+    # ---- 写出未恢复列表 ----
+    # v5.1: 反查 encoder fasta 拿原始 oligo
+    addr_to_oligo = {(e['block_id'], e['inblock_id']): e['oligo'] for e in ref_entries}
+    missing_path = os.path.join(outdir, f'missing_oligos_{tag}.tsv')
+    with open(missing_path, 'w', newline='') as f:
+        w = csv.writer(f, delimiter='\t')
+        w.writerow(['block_id', 'inblock_id', 'global_idx',
+                    'payload_idx', 'type', 'ref_full_oligo'])
+        for addr in sorted(missing_addrs):
+            bid, iid = addr
+            pidx = ref_addr_to_pidx.get(addr, -1)
+            ftype = ref_addr_to_type.get(addr, '')
+            ref_seq = addr_to_oligo.get(addr, '')
+            w.writerow([bid, iid, bid * len(indices) + iid, pidx, ftype, ref_seq])
+    print(f"  未恢复列表: {missing_path}  (含完整参考 oligo)")
+
+    # ---- 写出错误进入明细 ----
+    err_path = os.path.join(outdir, f'error_entries_{tag}.tsv')
+    with open(err_path, 'w', newline='') as f:
+        w = csv.writer(f, delimiter='\t')
+        w.writerow(['error_type', 'block_id', 'inblock_id', 'global_idx',
+                    'recovered_payload', 'ref_payload', 'payload_diff_bp'])
+        for bid, iid, payload in err_addr_not_in_ref_list:
+            w.writerow(['addr_not_in_ref', bid, iid,
+                        bid * len(indices) + iid, payload, '', 'N/A'])
+        for bid, iid, recov, ref in err_payload_mismatch_list:
+            diff = sum(c1 != c2 for c1, c2 in zip(recov, ref))
+            w.writerow(['payload_mismatch', bid, iid,
+                        bid * len(indices) + iid, recov, ref, diff])
+    print(f"  错误进入明细: {err_path}")
+    if n_err_payload_mismatch > 0:
+        print(f"     ★ 请人工检查 payload_mismatch 条目")
+
+    return {
+        'n_ref': len(ref_addrs),
+        'n_recovered': n_recovered,
+        'n_correct': n_correct,
+        'n_missing': len(missing_addrs),
+        'n_err_addr_not_in_ref': n_err_addr_not_in_ref,
+        'n_err_payload_mismatch': n_err_payload_mismatch,
+        'coverage_pct': coverage_pct,
+        'error_pct': n_total_err / max(n_recovered, 1) * 100,
+    }
+
+
+
+# =============================================================================
+# Step 5: 按数据类型统计恢复率 (v3 风格的详细分类表)
+# =============================================================================
+
+def analyse_recovery_by_type(final_payloads, indices, ec_table, params,
+                              ref_entries, outdir, primer_label=""):
+    """
+    v5.1: 输入改为 ref_entries (encoder fasta entries).
+    类型直接来自 fasta header (避免 csv 顺序被打乱的问题).
+
+    输入:
+      final_payloads: dict[(bid, iid)] -> {'payload': ..., ...}
+      params:         encoder params (用于 Coredata/Metadata 细分)
+      ref_entries:    list of dict from load_encoder_fasta
+      primer_label:   用于输出文件命名
+    """
+    print(f"\n[Step 5] 按数据类型统计恢复率 (v5.1: 类型来自 encoder fasta header)")
+
+    coredata_len = int(params.get('coredata_length', 0))
+    metadata_len = int(params.get('metadata_length', 0))
+    padding_len = int(params.get('padding_length', 0))
+    payload_len_param = int(params.get('payload_length', 124))
+
+    # 期望数从 fasta entries 统计
+    expected_main = sum(1 for e in ref_entries if e['type'] == 'main')
+    expected_meta_a = sum(1 for e in ref_entries if e['type'] == 'meta_a')
+    expected_meta_b = sum(1 for e in ref_entries if e['type'] == 'meta_b')
+    total_expected = len(ref_entries)
+    main_count = expected_main
+
+    print(f"  数据结构 (来自 encoder fasta):")
+    print(f"    Main (Coredata+Metadata): {expected_main:,} 条")
+    print(f"      Coredata: {coredata_len:,} nt")
+    print(f"      Metadata: {metadata_len:,} nt")
+    print(f"      Padding:  {padding_len} nt")
+    if expected_meta_a > 0:
+        print(f"    Meta-A: {expected_meta_a} 条")
+    if expected_meta_b > 0:
+        print(f"    Meta-B: {expected_meta_b} 条")
+    print(f"    总计: {total_expected:,} 条")
+
+    # 从 fasta entries 提取 addr → (payload_idx, ref_payload, type)
+    addr_to_ref = {}  # (bid, iid) → (payload_idx, ref_payload, fasta_type)
+
+    for entry in ref_entries:
+        seq = entry['oligo']
+        if len(seq) < 162:
+            continue
+        bid = entry['block_id']
+        iid = entry['inblock_id']
+        ref_payload = seq[38:162]
+        addr = (bid, iid)
+        if addr not in addr_to_ref:
+            addr_to_ref[addr] = (entry['payload_idx'], ref_payload, entry['type'])
+
+    print(f"  参考地址映射: {len(addr_to_ref):,} 条")
+    ref_addrs = set(addr_to_ref.keys())
+
+    type_stats = {
+        'main':    {'expected': expected_main,   'confirmed': 0, 'hash_ok_but_mismatch': 0, 'any_payload': 0},
+        'meta_a':  {'expected': expected_meta_a, 'confirmed': 0, 'hash_ok_but_mismatch': 0, 'any_payload': 0},
+        'meta_b':  {'expected': expected_meta_b, 'confirmed': 0, 'hash_ok_but_mismatch': 0, 'any_payload': 0},
+        'other':   {'expected': 0,               'confirmed': 0, 'hash_ok_but_mismatch': 0, 'any_payload': 0},
+    }
+
+    coredata_payloads = (coredata_len + payload_len_param - 1) // payload_len_param if coredata_len > 0 else 0
+    core_confirmed = 0
+    meta_in_main_confirmed = 0
+
+    for addr, info in final_payloads.items():
+        best_payload = info['payload']
+
+        if addr not in ref_addrs:
+            type_stats['other']['any_payload'] += 1
+            type_stats['other']['hash_ok_but_mismatch'] += 1
+            continue
+
+        pidx, ref_payload, fasta_type = addr_to_ref[addr]
+        dtype = fasta_type   # 直接用 fasta type, 不再 get_type 推断
+
+        type_stats[dtype]['any_payload'] += 1
+
+        if best_payload == ref_payload:
+            type_stats[dtype]['confirmed'] += 1
+            if dtype == 'main':
+                if pidx < coredata_payloads:
+                    core_confirmed += 1
+                else:
+                    meta_in_main_confirmed += 1
+        else:
+            type_stats[dtype]['hash_ok_but_mismatch'] += 1
+
+    # 打印
+    print(f"\n  ★ 分类恢复率 (Hash通过 + Payload与参考一致)")
+    print(f"  {'类型':<12} {'期望':>8} {'确认恢复':>10} {'恢复率':>9} {'Hash≠ref':>10} {'有payload':>10}")
+    print(f"  {'-'*62}")
+
+    total_exp = 0
+    total_confirmed = 0
+
+    for dtype in ['main', 'meta_a', 'meta_b']:
+        s = type_stats[dtype]
+        if s['expected'] == 0:
+            continue
+        exp = s['expected']
+        conf = s['confirmed']
+        mismatch = s['hash_ok_but_mismatch']
+        anyp = s['any_payload']
+        pct = conf / max(exp, 1) * 100
+
+        label = {'main': 'Main', 'meta_a': 'Meta-A', 'meta_b': 'Meta-B'}[dtype]
+        print(f"  {label:<12} {exp:>8,} {conf:>10,} {pct:>8.2f}% {mismatch:>10,} {anyp:>10,}")
+
+        total_exp += exp
+        total_confirmed += conf
+
+    print(f"  {'-'*62}")
+    total_pct = total_confirmed / max(total_exp, 1) * 100
+    print(f"  {'总计':<12} {total_exp:>8,} {total_confirmed:>10,} {total_pct:>8.2f}%")
+
+    # 其他库
+    s_other = type_stats['other']
+    if s_other['any_payload'] > 0:
+        print(f"\n  其他库 (地址不在本参考表中):")
+        print(f"    找到地址: {s_other['any_payload']:,}, 其中Hash通过: {s_other['hash_ok_but_mismatch']:,}")
+
+    # 地址冲突统计
+    total_mismatch = sum(s['hash_ok_but_mismatch'] for s in type_stats.values()
+                        if s is not type_stats['other'])
+    if total_mismatch > 0:
+        print(f"\n  地址冲突 (Hash通过但payload与本库参考不一致): {total_mismatch:,}")
+        print(f"  这些可能是其他库使用了相同地址的 oligo")
+
+    # Main 细分
+    if coredata_payloads > 0 and main_count > 0:
+        metadata_payloads = main_count - coredata_payloads
+        print(f"\n  ★ Main 细分 (确认恢复)")
+        print(f"    Coredata payloads: {coredata_payloads:,}, "
+              f"恢复 {core_confirmed:,} ({core_confirmed/max(coredata_payloads,1)*100:.2f}%)")
+        print(f"    Metadata payloads: {metadata_payloads:,}, "
+              f"恢复 {meta_in_main_confirmed:,} ({meta_in_main_confirmed/max(metadata_payloads,1)*100:.2f}%)")
+
+    # 输出明细 TSV
+    primer_tag = (primer_label or params.get('forward_primer', 'unknown'))[:10]
+    type_path = os.path.join(outdir, f'recovery_by_type_{primer_tag}.tsv')
+    with open(type_path, 'w', newline='') as f:
+        w = csv.writer(f, delimiter='\t')
+        w.writerow(['type', 'expected', 'confirmed', 'confirmed_pct',
+                    'hash_ok_mismatch', 'any_payload'])
+        for dtype in ['main', 'meta_a', 'meta_b', 'other']:
+            s = type_stats[dtype]
+            exp = s['expected']
+            conf = s['confirmed']
+            pct = conf / max(exp, 1) * 100 if exp > 0 else 0
+            w.writerow([dtype, exp, conf, f"{pct:.4f}",
+                        s['hash_ok_but_mismatch'], s['any_payload']])
+        # 总计行
+        w.writerow(['_total', total_exp, total_confirmed,
+                    f"{total_pct:.4f}",
+                    total_mismatch, sum(s['any_payload'] for s in type_stats.values())])
+        # Main 细分
+        if coredata_payloads > 0 and main_count > 0:
+            metadata_payloads = main_count - coredata_payloads
+            core_pct = core_confirmed / max(coredata_payloads, 1) * 100
+            mm_pct = meta_in_main_confirmed / max(metadata_payloads, 1) * 100
+            w.writerow(['_core', coredata_payloads, core_confirmed,
+                        f"{core_pct:.4f}", '-', '-'])
+            w.writerow(['_meta_in_main', metadata_payloads, meta_in_main_confirmed,
+                        f"{mm_pct:.4f}", '-', '-'])
+
+    print(f"\n  分类明细: {type_path}")
+
+    return type_stats
+
+
+
+# =============================================================================
+# Params 文件读取
+# =============================================================================
+
+def load_params_file(params_path):
+    """读取 encoder 输出的参数文件, 返回 dict."""
+    params = {}
+    with open(params_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            if '=' in line:
+                key, value = line.split('=', 1)
+                params[key.strip()] = value.strip()
+    return params
+
+
+# =============================================================================
+# 主程序
+# =============================================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='DNA Storage Recovery v5 — 4 元组多数投票 + K 阈值过滤',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''
+设计:
+  v5 删除 CAPMB / 聚类, 改用 4 元组 (read_block, read_inblock, read_payload,
+  read_hash) 完全相同的多数投票. 每个 (bid, iid) 桶取频次最高的 4 元组作为
+  winner, 频次 = coverage. 只有 coverage >= K (默认 2) 的桶被接受.
+
+  K=2 意为 "至少要看到 2 条完全一样的 read 才信", 是 PCR 复制 / 合成产物
+  的自我证实门槛, 能消除单条孤立 hash-pass 引入的 silent corruption.
+
+恢复层与评估层严格分离:
+  - 恢复层: 只输出主导库中 K 阈值通过的 (bid, iid, payload). 不看总表.
+  - 评估层 (需 --oligo-table): 用总表统计未恢复 + 错误进入两类事件,
+    Step 5 给 Main / Meta-A / Meta-B + Coredata / Metadata 细分.
+
+示例:
+  python dna_recovery_v5.py \\
+      --merged merged.fastq \\
+      --params Cat/output_params.txt Abstract/output_params.txt Pool/output_params.txt \\
+      --oligo-table S99989142new.csv \\
+      -o recovery_v5
+  # 默认 K=2, max_block_id=200
+
+  # 调整 K (更严格 = 更少错入但更多缺失)
+  python dna_recovery_v5.py ... --min-coverage 3 -o recovery_v5_k3
+''')
+    parser.add_argument('-r1', '--read1', default=None, help='R1 FASTQ (.fq.gz)')
+    parser.add_argument('-r2', '--read2', default=None, help='R2 FASTQ (.fq.gz)')
+    parser.add_argument('--merged', default=None,
+                        help='已合并的 FASTQ (跳过 PEAR)')
+    parser.add_argument('--params', default=None, nargs='+',
+                        help='Encoder 参数文件, 可一次给多个 (用于提取所有 primer 候选 + 评估)')
+    parser.add_argument('-p', '--primers', default=None, nargs='+',
+                        help='前引物列表 (可选). 不提供则从 --params 提取.')
+    parser.add_argument('--seed', type=int, default=None)
+    parser.add_argument('--num-indices', type=int, default=None)
+    parser.add_argument('--min-overlap', type=int, default=80,
+                        help='PEAR 最小重叠长度 (默认 80)')
+    parser.add_argument('--threads', type=int, default=4,
+                        help='PEAR 并行线程数 (默认 4)')
+    parser.add_argument('--oligo-table', default=None,
+                        help='[已废弃, 请用 --encoder-fasta] 参考 oligo 总表 CSV. '
+                             'CSV 顺序可能被合成商打乱, 不能正确反推 payload_idx.')
+    parser.add_argument('--encoder-fasta', default=None,
+                        help='主导库的 encoder 原始输出 fasta (启用评估层). '
+                             'fasta header 含真实 payload_idx + type. '
+                             '示例: /data/hjwu/DNA_index/Results_Abstract/output.fasta')
+    parser.add_argument('--max-block-id', type=int, default=200,
+                        help='block_id 上限 (默认 200). bid >= 此值的 reads 直接丢弃, '
+                             '消除 1bp 纠错过度引发的"幻影地址"错误进入.')
+    parser.add_argument('--no-block-id-limit', action='store_true',
+                        help='关闭 max_block_id 过滤.')
+    parser.add_argument('-K', '--min-coverage', type=int, default=2,
+                        help='K 阈值 (默认 2). winner 4 元组的频次 < K 的桶丢弃. '
+                             'K=2 意为至少要看到 2 条完全相同的 read 才信任 winner. '
+                             'K 越大 -> 错入越少 + 缺失越多. K=1 等于无过滤 (不推荐).')
+    parser.add_argument('-o', '--outdir', default='recovery_v5')
+    args = parser.parse_args()
+
+    # --- 加载 params 文件 ---
+    all_params = []
+    if args.params:
+        for pf in args.params:
+            print(f"[读取参数文件] {pf}")
+            p = load_params_file(pf)
+            p['_path'] = pf
+            dirname = os.path.basename(os.path.dirname(os.path.abspath(pf)))
+            p['_label'] = p.get('forward_primer', dirname)[:20]
+            all_params.append(p)
+            print(f"  seed={p.get('seed')}, indices={p.get('num_indices')}, "
+                  f"primer={p.get('forward_primer','?')[:20]}, "
+                  f"oligos={p.get('oligo_count','?')}")
+
+        first = all_params[0]
+        if args.seed is None and 'seed' in first:
+            args.seed = int(first['seed'])
+        if args.num_indices is None and 'num_indices' in first:
+            args.num_indices = int(first['num_indices'])
+
+    # 默认值
+    if args.seed is None:
+        args.seed = DEFAULT_SEED
+    if args.num_indices is None:
+        args.num_indices = 500
+
+    # --- 确定 primers 列表 + primer_tails ---
+    if args.primers:
+        primers = [p.upper() for p in args.primers]
+    elif all_params:
+        primers = []
+        for p in all_params:
+            fp = p.get('forward_primer')
+            if fp and fp.upper() not in primers:
+                primers.append(fp.upper())
+        if not primers:
+            primers = ['TGTGTTCCTCCTCGGTATGA']
+    else:
+        primers = ['TGTGTTCCTCCTCGGTATGA']
+
+    bad = [p for p in primers if len(p) != PRIMER_LENGTH]
+    if bad:
+        print(f"错误: 以下 primer 长度不是 {PRIMER_LENGTH} bp: {bad}")
+        sys.exit(1)
+
+    if args.merged is None and (args.read1 is None or args.read2 is None):
+        print("错误: 需要 -r1 + -r2, 或 --merged")
+        sys.exit(1)
+
+    if args.min_coverage < 1:
+        print(f"错误: --min-coverage 必须 >= 1")
+        sys.exit(1)
+
+    print("\n" + "=" * 65)
+    print("  DNA Storage Recovery v5")
+    print(f"  4 元组多数投票 + K={args.min_coverage} 阈值过滤")
+    print("=" * 65)
+
+    os.makedirs(args.outdir, exist_ok=True)
+
+    # primer_tails (启动时打印 hamming 验证)
+    primer_tails = compute_primer_tails(primers, n=PRIMER_TAIL_N)
+    n_primers = len(primers)
+
+    # --- Index 码本 ---
+    print(f"\n[Index 码本] seed={args.seed}, n={args.num_indices}")
+    indices = generate_orthogonal_indices(args.num_indices, args.seed)
+    print(f"  生成 {len(indices)} 个 index")
+    ec_table = build_error_correction_table(indices)
+    n_exact = len(indices)
+    n_1bp = len(ec_table) - n_exact
+    print(f"  纠错表: {len(ec_table):,} 条 (精确 {n_exact}, 1bp纠错 {n_1bp})")
+
+    # --- Step 1: 合并 ---
+    if args.merged:
+        print(f"\n[Step 1] 使用已合并的 FASTQ: {args.merged}")
+        merged_path = args.merged
+    else:
+        print(f"\n[Step 1] PEAR 合并")
+        merged_path, n_merged = run_pear_merge(
+            args.read1, args.read2, args.outdir,
+            min_overlap=args.min_overlap, threads=args.threads)
+
+    # --- Step 2: 4 元组分组计数 ---
+    effective_max_bid = None if args.no_block_id_limit else args.max_block_id
+    stats, bucket_counter = process_merged_reads(
+        merged_path, indices, ec_table, primer_tails,
+        max_block_id=effective_max_bid)
+
+    # --- 选主导库 ---
+    print(f"\n[选主导库]")
+    if effective_max_bid is not None:
+        print(f"  (注: bid >= {effective_max_bid} 已被过滤掉 "
+              f"{stats['bid_filtered']:,} 条 reads)")
+    print(f"  primer_id 分布 (按 reads 数):")
+    dominant_pid, primer_dist = select_dominant_primer(stats, primers)
+    for pid, cnt in primer_dist:
+        cnt_h = stats['primer_id_dist_hashpass'].get(pid, 0)
+        pct = cnt / max(stats['id_found'], 1) * 100
+        mark = "  ← 主导库" if pid == dominant_pid else ""
+        print(f"    #{pid} ({primers[pid][:20]}): {cnt:,} ({pct:.1f}%)  "
+              f"hash 通过 {cnt_h:,}{mark}")
+    dominant_primer = primers[dominant_pid]
+    print(f"\n  ★ 主导库 = primer_id {dominant_pid} ({dominant_primer})")
+
+    # --- Step 3: 应用 K 阈值, 输出产物 ---
+    final_payloads, n_below_k, n_other_buckets, coverage_dist = apply_k_threshold(
+        bucket_counter, dominant_pid, args.min_coverage)
+
+    total_ok = write_outputs(
+        args.outdir, stats, final_payloads, indices, dominant_pid,
+        primers, args.min_coverage, n_below_k, n_other_buckets, coverage_dist)
+
+    # --- Step 4 & 5: 评估 ---
+    if args.encoder_fasta:
+        # 找主导库对应的 params (用于 Coredata/Metadata 细分)
+        dominant_params = None
+        for p in all_params:
+            if p.get('forward_primer', '').upper() == dominant_primer:
+                dominant_params = p
+                break
+
+        # v5.1: 用 encoder fasta 替代 csv
+        ref_entries = load_encoder_fasta(args.encoder_fasta)
+
+        # 验证: fasta 里的 forward_primer 应与主导库一致
+        if ref_entries:
+            sample_oligo = ref_entries[0]['oligo']
+            fasta_fwd = sample_oligo[:20]
+            if fasta_fwd != dominant_primer:
+                print(f"\n  encoder_fasta 的 forward_primer ({fasta_fwd}) "
+                      f"与主导库 ({dominant_primer}) 不一致! 请确认 fasta 路径正确")
+
+        # Step 4: 错误进入两类核心评估
+        evaluate_dominant_library(
+            final_payloads, indices, ec_table, ref_entries,
+            args.outdir, dominant_pid, primer_label=dominant_primer,
+            params=dominant_params)
+
+        # Step 5: v3 风格的详细分类表
+        if dominant_params:
+            analyse_recovery_by_type(
+                final_payloads, indices, ec_table, dominant_params,
+                ref_entries, args.outdir, primer_label=dominant_primer)
+    elif args.oligo_table:
+        print("\n  --oligo-table 已废弃 (csv 顺序可能被打乱). 请改用 --encoder-fasta")
+    else:
+        print("\n  提示: 加 --encoder-fasta 参数可启用评估层")
+
+    print(f"\n{'='*65}")
+    print(f"  完成! 主导库 K={args.min_coverage} 阈值通过: {total_ok:,} 条 payload")
+    print(f"  输出: {args.outdir}/")
+    print(f"{'='*65}")
+
+
+if __name__ == "__main__":
+    main()
