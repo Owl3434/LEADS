@@ -1,0 +1,689 @@
+"""
+# ============================================================================
+# Range Asymmetric Numeral Systems (rANS)
+# ============================================================================
+#
+# This implementation is based on Asymmetric Numeral Systems (ANS) introduced by:
+#
+# J. Duda,
+# "Asymmetric Numeral Systems: Entropy Coding Combining Speed of Huffman
+# Coding with Compression Rate of Arithmetic Coding,"
+# arXiv:1311.2540, 2013.
+#
+# See also:
+# J. Duda, "Asymmetric Numeral Systems," arXiv:0902.0271, 2009.
+#
+# NOTE:
+# This code implements the range variant of ANS (rANS) directly.
+# Model probabilities are quantized into integer symbol frequencies and
+# used by the rANS state-transition and renormalization procedure.
+#
+# ============================================================================
+python DNA_image_encoder_rans.py -i image.png -m /path/to/llama -w weights.bin -o output.bin -p instruction
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from PIL import Image
+import struct
+import json
+import argparse
+from pathlib import Path
+from typing import List, Tuple, Dict
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+
+# ============================================================================
+# 配置
+# ============================================================================
+
+PATCH_SIZE = 16
+PIXELS_PER_PATCH = PATCH_SIZE * PATCH_SIZE * 3  # 768
+
+# rANS 参数 (按论文 Table 3)
+PROB_BITS = 12          # n: 概率量化精度
+PROB_SCALE = 1 << PROB_BITS  # 4096
+RANS_L = 1 << 16        # L: 归一化下界 = 65536
+RANS_B = 16             # b: 归一化输出位数
+
+# 验证必要条件: b >= n
+assert RANS_B >= PROB_BITS, f"必须 b >= n, 但 b={RANS_B}, n={PROB_BITS}"
+
+
+# ============================================================================
+# INT8 量化器
+# ============================================================================
+
+class INT8Quantizer:
+    """INT8对称量化"""
+    
+    @staticmethod
+    def dequantize(data: np.ndarray, scale: float) -> np.ndarray:
+        """将int8反量化为float32"""
+        return data.astype(np.float32) * scale
+
+
+# ============================================================================
+# rANS 编码器 (严格按论文实现)
+# ============================================================================
+
+class RANSEncoder:
+    """
+    rANS 编码器
+    
+    编码公式 (Eq.1):
+        x' = 2^n * (x // freq) + F(s) + (x % freq)
+    
+    归一化 (Eq.3):
+        while x >= (2^b / 2^n) * L * freq:
+            output x & (2^b - 1)
+            x = x >> b
+    """
+    
+    def __init__(self):
+        self.state = RANS_L  # 初始状态
+        self.output = []     # 输出的 16-bit words
+    
+    def encode_symbol(self, freqs: np.ndarray, cumul: np.ndarray, symbol: int):
+        """编码单个符号"""
+        freq = int(freqs[symbol])
+        start = int(cumul[symbol])  # F(s) = CDF
+        
+        x = self.state
+        
+        # 归一化阈值: x_max = (2^b / 2^n) * L * freq = (L << (b-n)) * freq
+        x_max = ((RANS_L >> PROB_BITS) << RANS_B) * freq
+        
+        # 归一化: 输出低 b 位
+        while x >= x_max:
+            self.output.append(x & 0xFFFF)
+            x >>= RANS_B
+        
+        # 编码 (Eq.1): x' = 2^n * (x // freq) + F(s) + (x mod freq)
+        q = x // freq
+        r = x % freq
+        self.state = (q << PROB_BITS) + start + r
+    
+    def finish(self) -> Tuple[int, List[int]]:
+        """完成编码，返回最终状态和输出"""
+        return self.state, self.output
+
+
+def quantize_pdf(pdf: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    量化概率分布
+    返回: (freqs, cumul) where sum(freqs) == PROB_SCALE
+    """
+    n = len(pdf)
+    
+    pdf = np.asarray(pdf, dtype=np.float64)
+    pdf = np.maximum(pdf, 1e-10)
+    pdf = pdf / pdf.sum()
+    
+    # 量化，每个符号至少频率 1
+    freqs = np.floor(pdf * PROB_SCALE).astype(np.int64)
+    freqs = np.maximum(freqs, 1)
+    
+    # 调整总和使其精确等于 PROB_SCALE
+    current_sum = freqs.sum()
+    diff = PROB_SCALE - current_sum
+    
+    if diff > 0:
+        # 需要增加：给最大概率的符号加
+        idx = np.argmax(pdf)
+        freqs[idx] += diff
+    elif diff < 0:
+        # 需要减少：从最大频率的符号减（但保持 >= 1）
+        diff = -diff
+        sorted_idx = np.argsort(freqs)[::-1]
+        for idx in sorted_idx:
+            if freqs[idx] > 1:
+                can_take = min(freqs[idx] - 1, diff)
+                freqs[idx] -= can_take
+                diff -= can_take
+                if diff == 0:
+                    break
+    
+    # 累积频率 (CDF)
+    cumul = np.zeros(n + 1, dtype=np.int64)
+    cumul[1:] = np.cumsum(freqs)
+    
+    # 最终验证和修正
+    if cumul[-1] != PROB_SCALE:
+        freqs[-1] += PROB_SCALE - cumul[-1]
+        cumul[1:] = np.cumsum(freqs)
+    
+    return freqs, cumul
+
+
+# ============================================================================
+# IA3-Llama 模型
+# ============================================================================
+
+class IA3LlamaModel(nn.Module):
+    """IA3-Llama模型（与训练程序架构一致）"""
+    
+    def __init__(self, model_path: str, ia3_weights_path: str, device: str = "cuda"):
+        super().__init__()
+        self.model_path = model_path
+        self.device = torch.device(device if torch.cuda.is_available() else "cpu")
+        
+        print(f"加载基础模型: {model_path}")
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=torch.float16,
+            device_map={"": self.device},
+            trust_remote_code=True
+        )
+        
+        # 获取模型配置
+        config = self.model.config
+        self.num_layers = config.num_hidden_layers
+        self.hidden_dim = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        self.num_attention_heads = config.num_attention_heads
+        self.num_key_value_heads = getattr(config, 'num_key_value_heads', self.num_attention_heads)
+        self.head_dim = self.hidden_dim // self.num_attention_heads
+        self.kv_dim = self.head_dim * self.num_key_value_heads
+        
+        # 冻结基础模型
+        for param in self.model.parameters():
+            param.requires_grad = False
+        
+        # 初始化IA3参数占位符
+        self.ia3_parameters = {}
+        
+        # 加载IA3权重
+        print(f"加载IA3权重: {ia3_weights_path}")
+        self._load_ia3_weights(ia3_weights_path)
+        
+        self.model.eval()
+        print("模型初始化完成")
+    
+    def _load_ia3_weights(self, weights_path: str):
+        """加载IA3权重（自动检测格式）"""
+        weights_path = Path(weights_path)
+        
+        # 尝试新格式（自包含）
+        if self._try_load_self_contained_bin(weights_path):
+            return
+        
+        # 尝试旧格式（bin + json）
+        base_path = weights_path.with_suffix('')
+        metadata_path = f"{base_path}_metadata.json"
+        
+        if Path(metadata_path).exists():
+            print("⚠ 检测到旧格式权重（需要JSON）")
+            self._load_legacy_format(base_path)
+        else:
+            raise FileNotFoundError(
+                f"无法加载权重: 需要 {metadata_path} 或自包含格式的bin文件"
+            )
+    
+    def _try_load_self_contained_bin(self, bin_path: Path) -> bool:
+        """尝试加载自包含格式的bin文件"""
+        try:
+            with open(bin_path, 'rb') as f:
+                magic = struct.unpack('<I', f.read(4))[0]
+                
+                # 检查魔数 (0x49413333)
+                if magic != 0x49413333:
+                    return False
+                
+                num_params = struct.unpack('<I', f.read(4))[0]
+                expected_params = self.num_layers * 3
+                
+                if num_params != expected_params:
+                    print(f"⚠ 参数数量不匹配: {num_params} vs {expected_params}")
+                    return False
+                
+                # 读取所有scale
+                scales = []
+                for _ in range(num_params):
+                    scale = struct.unpack('<f', f.read(4))[0]
+                    scales.append(scale)
+                
+                # 读取INT8数据
+                binary_data = f.read()
+            
+            # 解析参数
+            param_idx = 0
+            offset = 0
+            
+            for layer_idx in range(self.num_layers):
+                for module_name in ["k_proj", "v_proj", "up_proj"]:
+                    param_name = f"layer_{layer_idx}_{module_name}"
+                    
+                    # 确定大小
+                    if module_name in ["k_proj", "v_proj"]:
+                        size = self.kv_dim
+                    else:  # up_proj
+                        size = self.intermediate_size
+                    
+                    # 读取INT8数据
+                    chunk = binary_data[offset:offset + size]
+                    q_data = np.frombuffer(chunk, dtype=np.int8)
+                    offset += size
+                    
+                    # 反量化
+                    scale = scales[param_idx]
+                    fp_data = INT8Quantizer.dequantize(q_data, scale)
+                    
+                    # 转为tensor
+                    param_tensor = torch.from_numpy(fp_data).to(
+                        dtype=torch.float16,
+                        device=self.device
+                    )
+                    
+                    self.ia3_parameters[param_name] = param_tensor
+                    param_idx += 1
+            
+            print(f"加载了 {len(self.ia3_parameters)} 个IA3参数（自包含格式）")
+            self._register_ia3_hooks()
+            return True
+            
+        except Exception as e:
+            return False
+    
+    def _load_legacy_format(self, base_path: Path):
+        """加载旧格式（bin + json）"""
+        metadata_path = f"{base_path}_metadata.json"
+        
+        with open(metadata_path, 'r') as f:
+            metadata = json.load(f)
+        
+        param_order = metadata['parameter_order']
+        param_info = metadata['parameter_info']
+        
+        bin_path = f"{base_path}.bin"
+        with open(bin_path, 'rb') as f:
+            binary_data = f.read()
+        
+        offset = 0
+        for param_name in param_order:
+            info = param_info[param_name]
+            shape = info['shape']
+            size = info['size']
+            scale = info['scale']
+            
+            chunk = binary_data[offset:offset + size]
+            q_data = np.frombuffer(chunk, dtype=np.int8)
+            offset += size
+            
+            fp_data = INT8Quantizer.dequantize(q_data, scale)
+            fp_data = fp_data.reshape(shape)
+            
+            param_tensor = torch.from_numpy(fp_data).to(
+                dtype=torch.float16,
+                device=self.device
+            )
+            
+            self.ia3_parameters[param_name] = param_tensor
+        
+        print(f"加载了 {len(self.ia3_parameters)} 个IA3参数（旧格式）")
+        self._register_ia3_hooks()
+    
+    def _register_ia3_hooks(self):
+        """注册IA3钩子"""
+        for layer_idx, layer in enumerate(self.model.model.layers):
+            for module_name in ["k_proj", "v_proj", "up_proj"]:
+                param_name = f"layer_{layer_idx}_{module_name}"
+                
+                if param_name not in self.ia3_parameters:
+                    continue
+                
+                if module_name == "k_proj":
+                    target_module = layer.self_attn.k_proj
+                elif module_name == "v_proj":
+                    target_module = layer.self_attn.v_proj
+                elif module_name == "up_proj":
+                    target_module = layer.mlp.up_proj
+                
+                ia3_param = self.ia3_parameters[param_name]
+                
+                def make_hook(param):
+                    def hook(module, input, output):
+                        return output * param
+                    return hook
+                
+                target_module.register_forward_hook(make_hook(ia3_param))
+    
+    def forward(self, input_ids, attention_mask=None):
+        """前向传播"""
+        return self.model(input_ids=input_ids, attention_mask=attention_mask)
+
+
+# ============================================================================
+# DNA 压缩编码器 (rANS 版本)
+# ============================================================================
+
+class DNAEncoder:
+    """DNA无损图像压缩编码器（rANS版本）"""
+    
+    def __init__(self, model_path: str, ia3_weights_path: str, prompt_type: str = "instruction"):
+        """
+        初始化编码器
+        
+        Args:
+            model_path: Llama模型路径
+            ia3_weights_path: IA3权重路径
+            prompt_type: 提示词类型 (no_prompt, channel, instruction)
+        """
+        print("="*70)
+        print("DNA 无损图像压缩编码器 (rANS 版本)")
+        print("="*70)
+        print(f"Prompt类型: {prompt_type}")
+        print(f"rANS参数: n={PROB_BITS}, b={RANS_B}, L={RANS_L}")
+        
+        # 初始化模型
+        self.model = IA3LlamaModel(model_path, ia3_weights_path)
+        self.prompt_type = prompt_type
+        
+        # 加载tokenizer
+        print(f"加载tokenizer: {model_path}")
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_path, 
+            trust_remote_code=True,
+            use_fast=True
+        )
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+        if self.tokenizer.bos_token_id is None:
+            self.tokenizer.bos_token_id = 128000
+        
+        # 动态构建数字词表（和训练程序保持一致）
+        print("构建数字词表...")
+        self.digital_dict = {}
+        self.reverse_dict = {}
+        for i in range(256):
+            tokens = self.tokenizer.encode(str(i), add_special_tokens=False)
+            if len(tokens) != 1:
+                raise ValueError(f"数字 {i} 映射到 {len(tokens)} 个tokens（应该为1）")
+            token_id = tokens[0]
+            self.digital_dict[i] = token_id
+            self.reverse_dict[token_id] = i
+        
+        print(f"词表构建完成: 0-255 → {len(self.digital_dict)} tokens")
+        print("编码器初始化完成\n")
+    
+    def generate_prompt_tokens(self, x: int, y: int, img_width: int, img_height: int) -> List[int]:
+        """
+        生成提示词tokens（和训练程序保持一致）
+        
+        Args:
+            x, y: patch左上角坐标
+            img_width, img_height: 图像尺寸
+        """
+        if self.prompt_type == "no_prompt":
+            return [self.tokenizer.bos_token_id]
+        elif self.prompt_type == "channel":
+            prompt = "Every triplet denote an RGB pixel of a 2D image. Predict the next RGB pixel based on the previous pixels."
+            return [self.tokenizer.bos_token_id] + self.tokenizer.encode(prompt, add_special_tokens=False)
+        else:  # instruction
+            prompt = f"At position ({x:04d}, {y:04d}) begins a sequence where every triplet denotes an RGB pixel of a 2D image. Predict the next RGB pixel based on the previous pixels."
+            return [self.tokenizer.bos_token_id] + self.tokenizer.encode(prompt, add_special_tokens=False)
+    
+    def get_pixel_probability(self, context_tokens: List[int]) -> np.ndarray:
+        """
+        获取下一个像素值的256维概率分布
+        
+        在完整词表上计算softmax，然后提取256个像素token的概率。
+        
+        Returns:
+            256维概率数组（和可能小于1，会在rANS编码器中归一化）
+        """
+        device = self.model.device
+        context = torch.tensor(context_tokens, dtype=torch.long).unsqueeze(0).to(device)
+        
+        with torch.no_grad():
+            outputs = self.model(context)
+            logits = outputs.logits[0, -1, :]
+            
+            # 在完整词表上计算softmax
+            full_probs = torch.softmax(logits, dim=0)
+            
+            # 提取256个像素token的概率
+            pixel_probs = torch.zeros(256, device=device, dtype=torch.float32)
+            for pixel_val in range(256):
+                token_id = self.digital_dict[pixel_val]
+                pixel_probs[pixel_val] = full_probs[token_id]
+        
+        return pixel_probs.cpu().numpy()
+    
+    def compress_patch(self, patch_pixels: np.ndarray, x: int, y: int, 
+                      img_width: int, img_height: int) -> Tuple[int, List[int]]:
+        """
+        压缩一个patch (使用 rANS)
+        
+        rANS 是 LIFO 的，需要先收集所有符号和概率，然后反向编码
+        
+        Args:
+            patch_pixels: 扁平化的patch像素值 (768,)
+            x, y: patch左上角坐标
+            img_width, img_height: 图像尺寸
+            
+        Returns:
+            (final_state, output_words): 最终状态和输出的16-bit words列表
+        """
+        # 生成提示词tokens
+        prompt_tokens = self.generate_prompt_tokens(x, y, img_width, img_height)
+        context_tokens = prompt_tokens.copy()
+        
+        # 阶段1: 收集所有概率分布和符号
+        all_probs = []
+        all_symbols = []
+        
+        for pixel_val in patch_pixels:
+            pixel_val = int(pixel_val)
+            
+            # 获取概率分布
+            prob_dist = self.get_pixel_probability(context_tokens)
+            all_probs.append(prob_dist)
+            all_symbols.append(pixel_val)
+            
+            # 更新context
+            pixel_token = self.digital_dict[pixel_val]
+            context_tokens.append(pixel_token)
+        
+        # 阶段2: rANS 反向编码
+        encoder = RANSEncoder()
+        
+        for i in range(len(all_probs) - 1, -1, -1):
+            freqs, cumul = quantize_pdf(all_probs[i])
+            encoder.encode_symbol(freqs, cumul, all_symbols[i])
+        
+        final_state, output_words = encoder.finish()
+        return final_state, output_words
+    
+    def compress_image(self, image_path: str, output_path: str):
+        """压缩完整图像"""
+        print(f"加载图像: {image_path}")
+        img = Image.open(image_path).convert('RGB')
+        img_array = np.array(img)
+        original_h, original_w, c = img_array.shape
+        
+        # 计算padding尺寸（16的倍数）
+        padded_h = ((original_h + PATCH_SIZE - 1) // PATCH_SIZE) * PATCH_SIZE
+        padded_w = ((original_w + PATCH_SIZE - 1) // PATCH_SIZE) * PATCH_SIZE
+        
+        # Padding图像
+        if padded_h != original_h or padded_w != original_w:
+            padded_array = np.zeros((padded_h, padded_w, c), dtype=np.uint8)
+            padded_array[:original_h, :original_w, :] = img_array
+            img_array = padded_array
+            print(f"图像尺寸: {original_h}x{original_w} → Padding至 {padded_h}x{padded_w}")
+        else:
+            print(f"图像尺寸: {original_h}x{original_w} (无需padding)")
+        
+        n_h = padded_h // PATCH_SIZE
+        n_w = padded_w // PATCH_SIZE
+        num_patches = n_h * n_w
+        
+        print(f"Patches: {n_h}x{n_w} = {num_patches}")
+        print(f"\n开始压缩 (rANS)...\n")
+        
+        # 压缩所有patches
+        all_patch_states = []      # 每个 patch 的最终状态
+        all_patch_words = []       # 每个 patch 的输出 words
+        
+        for patch_idx in range(num_patches):
+            i = patch_idx // n_w
+            j = patch_idx % n_w
+            x = j * PATCH_SIZE
+            y = i * PATCH_SIZE
+            
+            print(f"Patch [{i},{j}] (第{patch_idx+1}/{num_patches}个)", end=" ")
+            
+            # 提取patch
+            patch = img_array[
+                i*PATCH_SIZE:(i+1)*PATCH_SIZE,
+                j*PATCH_SIZE:(j+1)*PATCH_SIZE,
+                :
+            ]
+            flat_patch = patch.flatten()
+            
+            # 压缩
+            final_state, output_words = self.compress_patch(flat_patch, x, y, padded_w, padded_h)
+            all_patch_states.append(final_state)
+            all_patch_words.append(output_words)
+            
+            # 显示统计
+            total_bits = len(output_words) * 16 + 64  # words + state
+            bits_per_token = total_bits / PIXELS_PER_PATCH
+            print(f"→ {len(output_words)} words, state=0x{final_state:08X} ({bits_per_token:.2f} bits/token)")
+        
+        # 保存压缩文件
+        self._save_compressed_file(
+            output_path,
+            original_w, original_h,
+            padded_w, padded_h,
+            all_patch_states,
+            all_patch_words
+        )
+        
+        # 打印统计
+        self._print_statistics(original_w, original_h, all_patch_words, output_path)
+    
+    def _save_compressed_file(self, output_path: str, 
+                             original_width: int, original_height: int,
+                             padded_width: int, padded_height: int,
+                             all_patch_states: List[int],
+                             all_patch_words: List[List[int]]):
+        """
+        保存压缩文件 (rANS 格式)
+        
+        格式:
+            [Header]
+            - magic: 4 bytes (0x524E5331 = 'RNS1')
+            - original_width: 4 bytes (uint32)
+            - original_height: 4 bytes (uint32)
+            - padded_width: 4 bytes (uint32)
+            - padded_height: 4 bytes (uint32)
+            - num_patches: 4 bytes (uint32)
+            - prob_bits: 1 byte (uint8)
+            - rans_b: 1 byte (uint8)
+            
+            [Patch Info] - 每个patch
+            - final_state: 8 bytes (uint64)
+            - num_words: 4 bytes (uint32)
+            
+            [Compressed Data]
+            - 所有patch的words (每个word 2 bytes, 反转顺序以便解码)
+        """
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        num_patches = len(all_patch_states)
+        
+        with open(output_path, 'wb') as f:
+            # Header
+            f.write(struct.pack('<I', 0x524E5331))  # 'RNS1' magic
+            f.write(struct.pack('<IIIII', 
+                                original_width, original_height,
+                                padded_width, padded_height,
+                                num_patches))
+            f.write(struct.pack('<BB', PROB_BITS, RANS_B))
+            
+            # Patch Info
+            for state, words in zip(all_patch_states, all_patch_words):
+                f.write(struct.pack('<QI', state, len(words)))
+            
+            # Compressed Data (反转顺序)
+            for words in all_patch_words:
+                reversed_words = list(reversed(words))
+                for w in reversed_words:
+                    f.write(struct.pack('<H', w))
+        
+        print(f"\n压缩文件已保存: {output_path}")
+    
+    def _print_statistics(self, width: int, height: int, 
+                         all_patch_words: List[List[int]], output_path: str):
+        """打印压缩统计"""
+        original_bytes = width * height * 3
+        
+        # 计算压缩bits (words + states)
+        num_patches = len(all_patch_words)
+        total_words = sum(len(words) for words in all_patch_words)
+        compressed_bits = total_words * 16 + num_patches * 64  # words + states
+        
+        compressed_bytes = Path(output_path).stat().st_size
+        
+        compression_ratio = original_bytes / compressed_bytes
+        bpp = (compressed_bytes * 8) / (width * height)
+        bps = bpp / 3
+        
+        avg_bits_per_token = compressed_bits / (num_patches * PIXELS_PER_PATCH)
+        
+        print(f"\n{'='*70}")
+        print(f"压缩统计 (rANS)")
+        print(f"{'='*70}")
+        print(f"原始大小:        {original_bytes:>12,} bytes")
+        print(f"压缩数据:        {compressed_bits:>12,} bits ({compressed_bits/8:,.0f} bytes)")
+        print(f"文件大小:        {compressed_bytes:>12,} bytes")
+        print(f"压缩率:          {compression_ratio:>12.2f}x")
+        print(f"每像素比特:      {bpp:>12.3f}")
+        print(f"每子像素比特:    {bps:>12.3f}")
+        print(f"平均bits/token:  {avg_bits_per_token:>12.3f}  ← 应接近3.0")
+        print(f"{'='*70}\n")
+
+
+# ============================================================================
+# 主程序
+# ============================================================================
+
+def main():
+    parser = argparse.ArgumentParser(description='DNA 无损图像压缩编码器 (rANS 版本)')
+    parser.add_argument('-i', '--image', required=True, help='输入图片路径')
+    parser.add_argument('-m', '--model', required=True, help='基础Llama模型路径')
+    parser.add_argument('-w', '--weights', required=True, help='IA3权重文件路径 (.bin)')
+    parser.add_argument('-o', '--output', required=True, help='输出压缩文件路径 (.bin)')
+    parser.add_argument('-p', '--prompt', default='instruction', 
+                       choices=['no_prompt', 'channel', 'instruction'],
+                       help='提示词类型 (默认: instruction)')
+    parser.add_argument('--device', default='cuda', choices=['cuda', 'cpu'],
+                       help='设备 (默认: cuda)')
+    
+    args = parser.parse_args()
+    
+    # 验证路径
+    if not Path(args.image).exists():
+        raise FileNotFoundError(f"图片不存在: {args.image}")
+    if not Path(args.model).exists():
+        raise FileNotFoundError(f"模型不存在: {args.model}")
+    if not Path(args.weights).exists():
+        raise FileNotFoundError(f"权重不存在: {args.weights}")
+    
+    # 创建编码器
+    encoder = DNAEncoder(args.model, args.weights, args.prompt)
+    
+    # 压缩图像
+    encoder.compress_image(args.image, args.output)
+    
+    print("压缩完成!")
+
+
+if __name__ == "__main__":
+    main()
