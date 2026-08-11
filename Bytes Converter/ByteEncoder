@@ -1,0 +1,119 @@
+"""
+python encoder_byte.py -i file1.json -i file2.h5 -i file3.bin -o output
+"""
+
+import argparse
+import lzma
+import struct
+import os
+from pathlib import Path
+
+
+def build_metadata(files: list[str]) -> bytes:
+    """
+    构建极简元数据
+    格式:
+        [2B] 文件数 N (uint16, little-endian)
+        [N 个条目]:
+            [1B] 文件名长度 L (uint8)
+            [LB] 文件名 (utf-8)
+            [4B] 原始数据长度 (uint32, little-endian)
+    """
+    meta = struct.pack('<H', len(files))  # 文件数
+    
+    for fpath in files:
+        fname = os.path.basename(fpath)
+        fname_bytes = fname.encode('utf-8')
+        
+        if len(fname_bytes) > 255:
+            raise ValueError(f"文件名过长: {fname}")
+        
+        fsize = os.path.getsize(fpath)
+        if fsize > 0xFFFFFFFF:
+            raise ValueError(f"文件过大(>4GB): {fname}")
+        
+        meta += struct.pack('<B', len(fname_bytes))  # 文件名长度
+        meta += fname_bytes                           # 文件名
+        meta += struct.pack('<I', fsize)              # 原始数据长度
+    
+    return meta
+
+
+def encode(input_files: list[str], output_prefix: str):
+    """
+    编码流程:
+    1. 构建元数据并lzma压缩
+    2. 每个文件单独lzma压缩
+    3. 拼接: 元数据.lzma + 文件1.lzma + 文件2.lzma + ...
+    4. 输出 .lzma 和 .byte 文件
+    """
+    # 验证所有输入文件存在
+    for fpath in input_files:
+        if not os.path.isfile(fpath):
+            raise FileNotFoundError(f"文件不存在: {fpath}")
+    
+    # 构建并压缩元数据
+    metadata = build_metadata(input_files)
+    compressed_meta = lzma.compress(metadata, preset=9)
+    
+    # 开始拼接
+    combined = compressed_meta
+    
+    # 压缩并拼接每个文件
+    for fpath in input_files:
+        print(f"处理: {fpath}")
+        with open(fpath, 'rb') as f:
+            data = f.read()
+        compressed = lzma.compress(data, preset=9)
+        
+        original_size = len(data)
+        compressed_size = len(compressed)
+        ratio = (1 - compressed_size / original_size) * 100 if original_size > 0 else 0
+        print(f"  原始: {original_size} B → 压缩: {compressed_size} B ({ratio:.1f}% 减少)")
+        
+        combined += compressed
+    
+    # 输出文件
+    lzma_path = f"{output_prefix}.lzma"
+    byte_path = f"{output_prefix}.bytes"
+    
+    with open(lzma_path, 'wb') as f:
+        f.write(combined)
+    
+    with open(byte_path, 'wb') as f:
+        f.write(combined)
+    
+    print(f"\n完成!")
+    print(f"  输出: {lzma_path} ({len(combined)} bytes)")
+    print(f"  输出: {byte_path} ({len(combined)} bytes)")
+    print(f"  元数据开销: {len(compressed_meta)} bytes")
+    
+    return lzma_path, byte_path
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='DNA存储文件编码器 - 多文件lzma压缩拼接',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='示例: python encoder_byte.py -i a.json -i b.h5 -i c.bin -o output'
+    )
+    parser.add_argument(
+        '-i', '--input',
+        action='append',
+        required=True,
+        metavar='FILE',
+        help='输入文件 (可多次使用)'
+    )
+    parser.add_argument(
+        '-o', '--output',
+        default='encoded',
+        metavar='PREFIX',
+        help='输出文件前缀 (默认: encoded)'
+    )
+    
+    args = parser.parse_args()
+    encode(args.input, args.output)
+
+
+if __name__ == '__main__':
+    main()
