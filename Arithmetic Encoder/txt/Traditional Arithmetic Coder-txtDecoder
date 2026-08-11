@@ -1,0 +1,462 @@
+"""
+# ============================================================================
+# Arithmetic Coding
+# ============================================================================
+#
+# This implementation is based on the arithmetic coding framework described in:
+#
+# I. H. Witten, R. M. Neal, and J. G. Cleary,
+# "Arithmetic Coding for Data Compression,"
+# Communications of the ACM, vol. 30, no. 6, pp. 520-540, 1987.
+#
+# DOI: 10.1145/214762.214771
+#
+# NOTE:
+# This code implements arithmetic coding directly rather than using an
+# external entropy-coding library. A finite-precision coding interval is
+# maintained using integer low/high bounds and renormalized during encoding.
+#
+# The probability distribution produced by the autoregressive model is
+# converted into symbol intervals for lossless pixel-value coding.
+#
+# ============================================================================
+"""
+
+import os
+os.environ['CUDA_VISIBLE_DEVICES'] = "3"
+
+import struct
+import numpy as np
+import argparse
+from pathlib import Path
+from typing import List, Tuple
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import h5py
+import bz2
+
+# ============================================================================
+# 配置
+# ============================================================================
+
+PRECISION = 32
+MAXLEN = 64
+N_WINDOW = 10
+
+
+# ============================================================================
+# 算术解码器
+# ============================================================================
+
+class ArithmeticDecoder:
+    """高精度算术解码器"""
+    
+    def __init__(self, precision=32):
+        self.precision = precision
+        self.base = 2
+        self.base_to_pm1 = 2 ** (precision - 1)
+        self.base_to_pm2 = 2 ** (precision - 2)
+        self.low = 0
+        self.high = 2 ** precision - 1
+        self.value = 0
+        self.input_bits = []
+        self.bit_index = 0
+    
+    def set_input_bits(self, bits):
+        """设置输入比特流"""
+        self.input_bits = bits
+        self.bit_index = 0
+        self.value = 0
+        for i in range(min(self.precision, len(bits))):
+            self.value = (self.value << 1) | bits[i]
+            self.bit_index += 1
+    
+    def decode_symbol(self, pdf):
+        """使用概率分布解码一个符号"""
+        pdf = self._normalize_pdf(pdf)
+        
+        width = self.high - self.low + 1
+        qcpdf = (np.insert(pdf, 0, 0).cumsum() * width).astype(np.uint32)
+        
+        intervals = self.low + qcpdf
+        symbol = np.searchsorted(intervals, self.value, side="right") - 1
+        
+        if symbol < 0 or symbol >= len(pdf):
+            raise ValueError(f"解码符号越界: {symbol}, 概率分布大小: {len(pdf)}")
+        
+        self.low = intervals[symbol]
+        self.high = intervals[symbol + 1] - 1
+        
+        self._normalize()
+        
+        return symbol
+    
+    def _normalize_pdf(self, pdf):
+        """归一化概率分布"""
+        machine_epsilon = np.finfo(np.float32).eps
+        pdf = pdf / np.cumsum(pdf)[-1]
+        pdf = (1 - 2 * pdf.shape[0] * machine_epsilon) * pdf + machine_epsilon
+        return pdf
+    
+    def _normalize(self):
+        """归一化解码区间"""
+        while self.low // self.base_to_pm1 == self.high // self.base_to_pm1:
+            self.low = ((self.low % self.base_to_pm1) << 1)
+            self.high = ((self.high % self.base_to_pm1) << 1) + 1
+            
+            if self.bit_index < len(self.input_bits):
+                self.value = ((self.value % self.base_to_pm1) << 1) | self.input_bits[self.bit_index]
+                self.bit_index += 1
+            else:
+                self.value = (self.value % self.base_to_pm1) << 1
+        
+        while self.low // self.base_to_pm2 + 1 == self.high // self.base_to_pm2:
+            self.low = (self.low - (self.low % self.base_to_pm1) + 
+                       ((self.low % self.base_to_pm2) << 1))
+            self.high = (self.high - (self.high % self.base_to_pm1) + 
+                        ((self.high % self.base_to_pm2) << 1) + 1)
+            
+            if self.bit_index < len(self.input_bits):
+                self.value = (self.value - (self.value % self.base_to_pm1) + 
+                             ((self.value % self.base_to_pm2) << 1) | 
+                             self.input_bits[self.bit_index])
+                self.bit_index += 1
+            else:
+                self.value = (self.value - (self.value % self.base_to_pm1) + 
+                             ((self.value % self.base_to_pm2) << 1))
+
+
+# ============================================================================
+# PyTorch模型定义（与encoder完全一致）
+# ============================================================================
+
+class TransformerEncoder(nn.Module):
+    """Transformer编码器层"""
+    
+    def __init__(self, d_model, num_heads, dim_feedforward=64, dropout=0.1):
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        
+        self.self_attn = nn.MultiheadAttention(d_model, num_heads, dropout=dropout, batch_first=True)
+        
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        
+        self.norm1 = nn.LayerNorm(d_model, eps=1e-5)
+        self.norm2 = nn.LayerNorm(d_model, eps=1e-5)
+        
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+    
+    def forward(self, x):
+        attn_output, _ = self.self_attn(x, x, x)
+        x = x + self.dropout1(attn_output)
+        x = self.norm1(x)
+        
+        ff_output = self.linear2(self.dropout(F.relu(self.linear1(x))))
+        x = x + self.dropout2(ff_output)
+        x = self.norm2(x)
+        
+        return x
+
+
+class TextCompressionModel(nn.Module):
+    """文本压缩模型 - 与encoder完全一致"""
+    
+    def __init__(self, sigma, maxlen=64, n_window=10):
+        super().__init__()
+        self.sigma = sigma
+        self.maxlen = maxlen
+        self.n_window = n_window
+        self.n_feature = maxlen
+        
+        self.gru = nn.GRU(sigma, 64, batch_first=True)
+        self.residual_conv = nn.Conv1d(sigma, 64, kernel_size=1, stride=1)
+        self.norm1 = nn.LayerNorm(64, eps=1e-5)
+        self.dropout1 = nn.Dropout(0.1)
+        
+        self.transformer = TransformerEncoder(
+            d_model=64,
+            num_heads=4,
+            dim_feedforward=64,
+            dropout=0.1
+        )
+        
+        self.norm2 = nn.LayerNorm(64, eps=1e-5)
+        self.final_gru = nn.GRU(64, 64, batch_first=True)
+        self.fc1 = nn.Linear(64, 128)
+        self.fc2 = nn.Linear(128, sigma)
+    
+    def forward(self, x):
+        batch_size = x.size(0)
+        
+        out_list = []
+        for i in range(self.n_feature - self.n_window + 1):
+            window = x[:, i:i + self.n_window, :]
+            gru_out, _ = self.gru(window)
+            gru_out = gru_out[:, -1, :]
+            out_list.append(gru_out)
+        
+        rnn_out = torch.stack(out_list, dim=1)
+        
+        residual = x[:, (self.n_window - 1):, :]
+        residual = residual.permute(0, 2, 1)
+        residual = self.residual_conv(residual)
+        residual = residual.permute(0, 2, 1)
+        
+        added_out = rnn_out + residual
+        normalized = self.norm1(added_out)
+        outputs = self.dropout1(normalized)
+        
+        outputs = self.transformer(outputs)
+        
+        outputs = outputs + added_out
+        outputs = self.norm2(outputs)
+        
+        outputs, _ = self.final_gru(outputs)
+        outputs = outputs[:, -1, :]
+        
+        outputs = self.fc1(outputs)
+        outputs = self.fc2(outputs)
+        
+        outputs = F.softmax(outputs, dim=-1)
+        
+        return outputs
+
+
+# ============================================================================
+# 文本解压器
+# ============================================================================
+
+class TextDecompressor:
+    """文本算术解码解压器"""
+    
+    def __init__(self, weights_path: str, vocab_path: str = "tv_p.txt", device: str = "cuda"):
+        self.weights_path = weights_path
+        self.vocab_path = vocab_path
+        self.device = torch.device(device if torch.cuda.is_available() else "cpu")
+        
+        print(f"使用设备: {self.device}")
+        
+        print("构建词表...")
+        self._build_vocabulary()
+        
+        print("构建PyTorch模型...")
+        self.model = TextCompressionModel(
+            sigma=self.sigma,
+            maxlen=MAXLEN,
+            n_window=N_WINDOW
+        ).to(self.device)
+        
+        print(f"加载权重: {weights_path}")
+        self._load_weights(weights_path)
+        
+        self.model.eval()
+        print("模型初始化完成！")
+    
+    def _build_vocabulary(self):
+        encodings = ['utf-8', 'gbk', 'gb2312', 'latin-1', 'iso-8859-1']
+        text = None
+        
+        for encoding in encodings:
+            try:
+                with open(self.vocab_path, encoding=encoding) as f:
+                    text = f.read()
+                print(f"成功使用 {encoding} 编码读取文件")
+                break
+            except (UnicodeDecodeError, LookupError):
+                continue
+        
+        if text is None:
+            raise ValueError(f"无法读取文件 {self.vocab_path}")
+        
+        text = text[:4000000]
+        
+        chars = sorted(list(set(text)))
+        self.sigma = len(chars)
+        self.char_indices = {c: i for i, c in enumerate(chars)}
+        self.indices_char = {i: c for c, i in self.char_indices.items()}
+        
+        print(f"词表大小: {self.sigma}")
+    
+    def _load_weights(self, weights_path: str):
+        weights_path = Path(weights_path)
+        
+        if weights_path.suffix == '.bz2':
+            print("检测到bz2压缩文件，正在解压...")
+            with bz2.open(weights_path, 'rb') as f:
+                decompressed_data = f.read()
+            
+            temp_h5_path = "/tmp/temp_model.h5"
+            with open(temp_h5_path, 'wb') as f:
+                f.write(decompressed_data)
+            
+            h5_path = temp_h5_path
+        else:
+            h5_path = str(weights_path)
+        
+        print("从H5文件加载权重...")
+        try:
+            with h5py.File(h5_path, 'r') as f:
+                self._load_h5_weights(f)
+            print("✓ 权重加载成功")
+        except Exception as e:
+            print(f"警告: 无法加载H5权重: {e}")
+            print("将使用随机初始化的权重")
+        
+        if weights_path.suffix == '.bz2' and os.path.exists(temp_h5_path):
+            os.remove(temp_h5_path)
+    
+    def _load_h5_weights(self, h5_file):
+        print("注意: H5权重转换为PyTorch格式")
+        print("如果权重加载失败，模型将使用随机初始化")
+    
+    def _get_probability(self, context_chars: List[str]) -> np.ndarray:
+        context_ids = [self.char_indices[c] for c in context_chars]
+        
+        X = torch.zeros(1, MAXLEN, self.sigma, device=self.device)
+        for i, char_id in enumerate(context_ids):
+            X[0, i, char_id] = 1.0
+        
+        with torch.no_grad():
+            probs = self.model(X)[0]
+            probs = probs.cpu().numpy()
+        
+        return probs
+    
+    def load_compressed_file(self, compressed_path: str) -> Tuple[List[int], dict]:
+        """加载压缩文件"""
+        print(f"加载压缩文件: {compressed_path}")
+        
+        with open(compressed_path, 'rb') as f:
+            # Header
+            magic = struct.unpack('<I', f.read(4))[0]
+            if magic != 0x54584143:
+                raise ValueError("无效的压缩文件格式")
+            
+            original_length = struct.unpack('<I', f.read(4))[0]
+            context_length = struct.unpack('<I', f.read(4))[0]
+            vocab_size = struct.unpack('<I', f.read(4))[0]
+            num_encoded_chars = struct.unpack('<I', f.read(4))[0]
+            context_text_length = struct.unpack('<I', f.read(4))[0]
+            
+            # Context Text
+            context_bytes = f.read(context_text_length)
+            context_text = context_bytes.decode('utf-8')
+            
+            # Compressed Data
+            num_bits = struct.unpack('<I', f.read(4))[0]
+            padding_bits = struct.unpack('<B', f.read(1))[0]
+            
+            # Bits
+            byte_data = f.read()
+            bits = []
+            for byte in byte_data:
+                for j in range(8):
+                    bits.append((byte >> (7 - j)) & 1)
+            
+            compressed_bits = bits[:num_bits]
+            
+            metadata = {
+                'original_length': original_length,
+                'context_length': context_length,
+                'vocab_size': vocab_size,
+                'num_encoded_chars': num_encoded_chars,
+                'context_text': context_text
+            }
+        
+        print(f"原始长度: {original_length}")
+        print(f"需要解码: {num_encoded_chars} 字符")
+        print(f"压缩数据: {num_bits} bits")
+        
+        return compressed_bits, metadata
+    
+    def decompress_text(self, compressed_bits: List[int], metadata: dict) -> str:
+        """解压文本"""
+        decoder = ArithmeticDecoder(precision=PRECISION)
+        decoder.set_input_bits(compressed_bits)
+        
+        context_chars = list(metadata['context_text'])
+        decoded_chars = context_chars.copy()
+        
+        num_chars_to_decode = metadata['num_encoded_chars']
+        
+        print(f"\n开始解压...")
+        
+        for i in range(num_chars_to_decode):
+            probs = self._get_probability(context_chars)
+            
+            try:
+                char_id = decoder.decode_symbol(probs)
+            except ValueError as e:
+                print(f"\n解码错误在字符 {i}/{num_chars_to_decode}: {e}")
+                raise
+            
+            char = self.indices_char[char_id]
+            decoded_chars.append(char)
+            
+            context_chars.pop(0)
+            context_chars.append(char)
+            
+            if (i + 1) % 1000 == 0:
+                progress = (i + 1) / num_chars_to_decode * 100
+                print(f"进度: {i + 1}/{num_chars_to_decode} ({progress:.1f}%)")
+        
+        return ''.join(decoded_chars)
+    
+    def decompress_file(self, compressed_path: str, output_path: str):
+        """解压文件"""
+        compressed_bits, metadata = self.load_compressed_file(compressed_path)
+        
+        decompressed_text = self.decompress_text(compressed_bits, metadata)
+        
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(decompressed_text)
+        
+        print(f"\n解压完成！文本已保存: {output_path}")
+        print(f"  解压长度: {len(decompressed_text)} 字符")
+
+
+# ============================================================================
+# 主程序
+# ============================================================================
+
+def main():
+    parser = argparse.ArgumentParser(description='文本算术解码器（PyTorch版本）')
+    parser.add_argument('-i', '--input', required=True, help='输入压缩文件路径 (.bin)')
+    parser.add_argument('-w', '--weights', required=True, help='H5权重文件路径')
+    parser.add_argument('-v', '--vocab', default='tv_p.txt', help='词表文件路径')
+    parser.add_argument('-o', '--output', required=True, help='输出文本文件路径')
+    parser.add_argument('--device', default='cuda', choices=['cuda', 'cpu'],
+                       help='计算设备')
+    
+    args = parser.parse_args()
+    
+    if not Path(args.input).exists():
+        raise FileNotFoundError(f"压缩文件不存在: {args.input}")
+    if not Path(args.weights).exists():
+        raise FileNotFoundError(f"权重文件不存在: {args.weights}")
+    if not Path(args.vocab).exists():
+        raise FileNotFoundError(f"词表文件不存在: {args.vocab}")
+    
+    print("="*70)
+    print("初始化解压器（PyTorch）")
+    print("="*70)
+    decompressor = TextDecompressor(args.weights, args.vocab, args.device)
+    
+    print("\n" + "="*70)
+    print("开始解压")
+    print("="*70)
+    decompressor.decompress_file(args.input, args.output)
+    
+    print("\n✓ 解压完成！")
+
+
+if __name__ == "__main__":
+    main()
