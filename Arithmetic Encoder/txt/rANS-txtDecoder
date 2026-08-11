@@ -1,0 +1,518 @@
+"""
+# ============================================================================
+# Range Asymmetric Numeral Systems (rANS)
+# ============================================================================
+#
+# This implementation is based on Asymmetric Numeral Systems (ANS) introduced by:
+#
+# J. Duda,
+# "Asymmetric Numeral Systems: Entropy Coding Combining Speed of Huffman
+# Coding with Compression Rate of Arithmetic Coding,"
+# arXiv:1311.2540, 2013.
+#
+# See also:
+# J. Duda, "Asymmetric Numeral Systems," arXiv:0902.0271, 2009.
+#
+# NOTE:
+# This code implements the range variant of ANS (rANS) directly.
+# Model probabilities are quantized into integer symbol frequencies and
+# used by the rANS state-transition and renormalization procedure.
+#
+# ============================================================================
+"""
+
+import os
+os.environ['CUDA_VISIBLE_DEVICES'] = "3"
+os.environ['TF_GPU_THREAD_MODE'] = 'gpu_private'
+os.environ['TF_GPU_THREAD_COUNT'] = '1'
+
+import struct
+import numpy as np
+import argparse
+from pathlib import Path
+from typing import List, Tuple
+import time
+import tensorflow as tf
+import keras
+from keras import layers
+import keras.backend as K
+
+# ============================================================================
+# GPU优化配置
+# ============================================================================
+tf.config.optimizer.set_jit(True)  # 启用XLA
+physical_devices = tf.config.list_physical_devices('GPU')
+if physical_devices:
+    tf.config.experimental.set_memory_growth(physical_devices[0], True)
+
+MAXLEN = 64
+N_WINDOW = 10
+
+# rANS 参数 (从文件头读取，但定义默认值)
+RANS_L = 1 << 16  # L: 归一化下界 = 65536
+
+
+# ============================================================================
+# rANS 解码器
+# ============================================================================
+
+class RANSDecoder:
+    """
+    rANS 解码器
+    
+    解码公式 (Eq.2):
+        slot = x mod 2^n
+        找 s 使得 F(s) <= slot < F(s+1)
+        x' = f(s) * (x >> n) + slot - F(s)
+    
+    归一化 (Eq.4):
+        while x < L: x = (x << b) | next_word
+    """
+    
+    def __init__(self, initial_state: int, words: List[int], prob_bits: int, rans_b: int):
+        self.state = initial_state
+        self.words = words
+        self.pos = 0
+        self.prob_bits = prob_bits
+        self.prob_scale = 1 << prob_bits
+        self.rans_b = rans_b
+    
+    def decode_symbol(self, freqs: np.ndarray, cumul: np.ndarray) -> int:
+        """解码单个符号"""
+        # slot = x mod 2^n
+        slot = self.state & (self.prob_scale - 1)
+        
+        # 查找符号: F(s) <= slot < F(s+1)
+        symbol = 0
+        for i in range(len(cumul) - 1):
+            if cumul[i] <= slot < cumul[i + 1]:
+                symbol = i
+                break
+        
+        freq = int(freqs[symbol])
+        start = int(cumul[symbol])  # F(s)
+        
+        # 解码 (Eq.2): x' = f(s) * (x >> n) + slot - F(s)
+        self.state = freq * (self.state >> self.prob_bits) + slot - start
+        
+        # 归一化 (Eq.4): while x < L
+        while self.state < RANS_L and self.pos < len(self.words):
+            self.state = (self.state << self.rans_b) | self.words[self.pos]
+            self.pos += 1
+        
+        return symbol
+
+
+def quantize_pdf(pdf: np.ndarray, prob_scale: int) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    量化概率分布（必须与编码器完全一致）
+    """
+    n = len(pdf)
+    
+    pdf = np.asarray(pdf, dtype=np.float64)
+    pdf = np.maximum(pdf, 1e-10)
+    pdf = pdf / pdf.sum()
+    
+    freqs = np.floor(pdf * prob_scale).astype(np.int64)
+    freqs = np.maximum(freqs, 1)
+    
+    current_sum = freqs.sum()
+    diff = prob_scale - current_sum
+    
+    if diff > 0:
+        idx = np.argmax(pdf)
+        freqs[idx] += diff
+    elif diff < 0:
+        diff = -diff
+        sorted_idx = np.argsort(freqs)[::-1]
+        for idx in sorted_idx:
+            if freqs[idx] > 1:
+                can_take = min(freqs[idx] - 1, diff)
+                freqs[idx] -= can_take
+                diff -= can_take
+                if diff == 0:
+                    break
+    
+    cumul = np.zeros(n + 1, dtype=np.int64)
+    cumul[1:] = np.cumsum(freqs)
+    
+    if cumul[-1] != prob_scale:
+        freqs[-1] += prob_scale - cumul[-1]
+        cumul[1:] = np.cumsum(freqs)
+    
+    return freqs, cumul
+
+
+# ============================================================================
+# 简化的Transformer编码器
+# ============================================================================
+
+class SimpleTransformerEncoder(keras.layers.Layer):
+    def __init__(self, intermediate_dim, num_heads, dropout=0, **kwargs):
+        super().__init__(**kwargs)
+        self.intermediate_dim = intermediate_dim
+        self.num_heads = num_heads
+        self.dropout = dropout
+        self.supports_masking = True
+
+    def build(self, input_shape):
+        feature_size = input_shape[-1]
+        self.attention = keras.layers.MultiHeadAttention(
+            num_heads=self.num_heads,
+            key_dim=feature_size // self.num_heads,
+            dropout=self.dropout,
+        )
+        self.norm1 = keras.layers.LayerNormalization(epsilon=1e-5)
+        self.norm2 = keras.layers.LayerNormalization(epsilon=1e-5)
+        self.dense1 = keras.layers.Dense(self.intermediate_dim, activation='relu')
+        self.dense2 = keras.layers.Dense(feature_size)
+        self.dropout_layer = keras.layers.Dropout(self.dropout)
+
+    def call(self, inputs, training=False):
+        attn = self.attention(inputs, inputs, training=training)
+        attn = self.dropout_layer(attn, training=training)
+        x = self.norm1(inputs + attn)
+        ff = self.dense2(self.dense1(x))
+        ff = self.dropout_layer(ff, training=training)
+        return self.norm2(x + ff)
+
+
+def build_model(sigma, maxlen=64, n_window=10):
+    """构建模型"""
+    n_feature = maxlen
+    inputs = keras.Input(shape=(n_feature, sigma,))
+    gru = layers.GRU(64)
+    
+    out_list = []
+    for i in range(n_feature - n_window + 1):
+        window = inputs[:, i: i + n_window]
+        gru_out = gru(window)
+        out_list.append(gru_out)
+    
+    rnn_out = K.stack(out_list, axis=1)
+    residual = inputs[:, (n_window - 1):]
+    residual = layers.Conv1D(64, 1, strides=1, activation=None)(residual)
+    
+    added_out = layers.add([rnn_out, residual])
+    normalized = layers.LayerNormalization(epsilon=1e-5)(added_out)
+    outputs = layers.Dropout(rate=0.1)(normalized)
+    
+    outputs = SimpleTransformerEncoder(
+        intermediate_dim=64,
+        num_heads=4,
+        dropout=0.1,
+    )(outputs)
+    
+    outputs = layers.add([outputs, added_out])
+    outputs = layers.LayerNormalization(epsilon=1e-5)(outputs)
+    outputs = layers.GRU(64)(outputs)
+    outputs = layers.Dense(128)(outputs)
+    outputs = layers.Dense(sigma, activation="softmax")(outputs)
+    
+    return keras.Model(inputs, outputs)
+
+
+# ============================================================================
+# 优化的文本解压器 (rANS 版本)
+# ============================================================================
+
+class OptimizedTextDecompressor:
+    """优化的文本解压器 (rANS 版本)"""
+    
+    def __init__(self, weights_path: str, vocab_path: str):
+        print("初始化解压器（rANS 版本）...")
+        
+        # 加载词表
+        if vocab_path.endswith('.npy'):
+            vocab_array = np.load(vocab_path, allow_pickle=True)
+            if vocab_array.dtype == object:
+                chars = vocab_array.tolist()
+            else:
+                chars = [chr(int(x)) for x in vocab_array]
+        else:
+            with open(vocab_path, 'r', encoding='utf-8') as f:
+                chars = sorted(list(set(f.read())))
+        
+        self.chars = chars
+        self.sigma = len(chars)
+        self.char_indices = {c: i for i, c in enumerate(chars)}
+        self.indices_char = {i: c for c, i in self.char_indices.items()}
+        
+        print(f"✓ 词表大小: {self.sigma}")
+        
+        # 构建模型
+        print("构建模型...")
+        self.model = build_model(self.sigma, MAXLEN, N_WINDOW)
+        
+        # 加载权重
+        print(f"加载权重: {weights_path}")
+        self.model.load_weights(weights_path)
+        
+        # 🚀 编译推理函数（XLA优化）
+        print("编译推理函数（XLA优化）...")
+        
+        @tf.function(
+            jit_compile=True,
+            reduce_retracing=True,
+            experimental_relax_shapes=True
+        )
+        def predict_func(x):
+            return self.model(x, training=False)
+        
+        self.predict_func = predict_func
+        
+        # 🚀 预热模型
+        print("预热模型...")
+        dummy_input = tf.zeros((1, MAXLEN, self.sigma), dtype=tf.float32)
+        for i in range(10):
+            _ = self.predict_func(dummy_input)
+            if i == 0:
+                print("  首次调用完成（编译中...）")
+        print("  ✓ 预热完成")
+        
+        # 🚀 预分配GPU缓冲区
+        self.X_buffer = tf.Variable(
+            tf.zeros((1, MAXLEN, self.sigma), dtype=tf.float32),
+            trainable=False
+        )
+        print("✓ GPU缓冲区已分配\n")
+    
+    def _get_probability_optimized(self, context_ids: List[int]) -> np.ndarray:
+        """优化的概率预测（必须与编码器完全一致）"""
+        # 重置缓冲区
+        self.X_buffer.assign(tf.zeros((1, MAXLEN, self.sigma), dtype=tf.float32))
+        
+        # 构建indices并更新
+        indices = [[0, i, char_id] for i, char_id in enumerate(context_ids)]
+        updates = tf.ones(len(indices), dtype=tf.float32)
+        self.X_buffer.assign(
+            tf.tensor_scatter_nd_update(self.X_buffer, indices, updates)
+        )
+        
+        # 推理
+        probs = self.predict_func(self.X_buffer)
+        probs = probs.numpy()[0]
+        
+        # 精度保护（与编码器完全一致）
+        min_prob = 1e-10
+        probs = np.maximum(probs, min_prob)
+        probs = probs / probs.sum()
+        
+        return probs
+    
+    def load_compressed(self, compressed_path: str) -> Tuple[int, List[int], dict]:
+        """加载压缩文件 (rANS 格式)"""
+        compressed_path = Path(compressed_path)
+        
+        if not compressed_path.exists():
+            raise FileNotFoundError(f"压缩文件不存在: {compressed_path}")
+        
+        print(f"读取压缩文件: {compressed_path}")
+        
+        with open(compressed_path, 'rb') as f:
+            # 读取Header
+            magic = struct.unpack('<I', f.read(4))[0]
+            if magic != 0x524E5354:  # 'RNST'
+                raise ValueError(f"无效的文件格式: magic={hex(magic)}")
+            
+            original_length = struct.unpack('<I', f.read(4))[0]
+            context_length = struct.unpack('<I', f.read(4))[0]
+            vocab_size = struct.unpack('<I', f.read(4))[0]
+            num_encoded_chars = struct.unpack('<I', f.read(4))[0]
+            prob_bits = struct.unpack('<B', f.read(1))[0]
+            rans_b = struct.unpack('<B', f.read(1))[0]
+            context_bytes_len = struct.unpack('<I', f.read(4))[0]
+            
+            # 读取Context Text
+            context_bytes = f.read(context_bytes_len)
+            context_text = context_bytes.decode('utf-8')
+            
+            # 读取 rANS 数据
+            final_state = struct.unpack('<Q', f.read(8))[0]
+            num_words = struct.unpack('<I', f.read(4))[0]
+            
+            # 读取 words
+            words = []
+            for _ in range(num_words):
+                w = struct.unpack('<H', f.read(2))[0]
+                words.append(w)
+        
+        metadata = {
+            'original_length': original_length,
+            'context_length': context_length,
+            'vocab_size': vocab_size,
+            'num_encoded_chars': num_encoded_chars,
+            'context_text': context_text,
+            'prob_bits': prob_bits,
+            'rans_b': rans_b
+        }
+        
+        print(f"✓ 文件读取完成")
+        print(f"  原始长度: {original_length}")
+        print(f"  上下文长度: {context_length}")
+        print(f"  词表大小: {vocab_size}")
+        print(f"  需解码字符数: {num_encoded_chars}")
+        print(f"  rANS参数: n={prob_bits}, b={rans_b}")
+        print(f"  初始状态: 0x{final_state:016X}")
+        print(f"  Words数量: {num_words}")
+        
+        return final_state, words, metadata
+    
+    def decompress_text(self, final_state: int, words: List[int], metadata: dict) -> str:
+        """解压文本 (rANS 版本)"""
+        
+        # 验证词表大小
+        if metadata['vocab_size'] != self.sigma:
+            raise ValueError(
+                f"词表大小不匹配: 文件={metadata['vocab_size']}, "
+                f"模型={self.sigma}"
+            )
+        
+        prob_bits = metadata['prob_bits']
+        rans_b = metadata['rans_b']
+        prob_scale = 1 << prob_bits
+        
+        # 初始化 rANS 解码器
+        decoder = RANSDecoder(final_state, words, prob_bits, rans_b)
+        
+        # 初始上下文
+        context_text = metadata['context_text']
+        context_chars = list(context_text)
+        
+        # 检查上下文字符是否都在词表中
+        unknown_chars = set(c for c in context_chars if c not in self.char_indices)
+        if unknown_chars:
+            raise ValueError(f"上下文包含不在词表中的字符: {unknown_chars}")
+        
+        # 解码结果
+        decoded_chars = list(context_chars)
+        context_ids = [self.char_indices[c] for c in context_chars]
+        
+        print("\n开始解压 (rANS)...")
+        start_time = time.time()
+        
+        num_to_decode = metadata['num_encoded_chars']
+        
+        for i in range(num_to_decode):
+            # 获取概率分布（必须与编码时完全一致）
+            probs = self._get_probability_optimized(context_ids)
+            
+            # 量化概率分布
+            freqs, cumul = quantize_pdf(probs, prob_scale)
+            
+            # 解码一个字符
+            char_id = decoder.decode_symbol(freqs, cumul)
+            
+            if char_id < 0 or char_id >= self.sigma:
+                raise ValueError(f"无效的字符ID: {char_id}")
+            
+            char = self.indices_char[char_id]
+            
+            # 添加到结果
+            decoded_chars.append(char)
+            
+            # 🎯 详细输出（每500个字符）
+            if i < 5 or (i + 1) % 500 == 0:
+                elapsed = time.time() - start_time
+                speed = (i + 1) / elapsed if elapsed > 0 else 0
+                
+                print(f"\n字符 {i}: '{char}' (id={char_id})")
+                print(f"  速度: {speed:.1f} 字符/秒")
+                print(f"  概率分布统计: min={probs.min():.6e}, max={probs.max():.6e}, sum={probs.sum():.6f}")
+                print(f"  该字符概率: {probs[char_id]:.6e}")
+                
+                top5_idx = np.argsort(probs)[-5:][::-1]
+                print(f"  Top-5概率: {[(self.indices_char[idx], f'{probs[idx]:.6e}') for idx in top5_idx]}")
+            
+            # 更新上下文（滑动窗口）
+            context_ids.pop(0)
+            context_ids.append(char_id)
+            
+            # 进度
+            if (i + 1) % 1000 == 0:
+                progress = (i + 1) / num_to_decode * 100
+                print(f"进度: {i + 1}/{num_to_decode} ({progress:.1f}%)")
+        
+        total_time = time.time() - start_time
+        avg_speed = num_to_decode / total_time
+        print(f"\n✓ 解压完成！")
+        print(f"平均速度: {avg_speed:.1f} 字符/秒")
+        print(f"总时间: {total_time:.1f} 秒")
+        
+        # 转换为字符串
+        decoded_text = ''.join(decoded_chars)
+        
+        # 验证长度
+        if len(decoded_text) != metadata['original_length']:
+            print(f"⚠️ 警告: 解压长度 {len(decoded_text)} != 原始长度 {metadata['original_length']}")
+        else:
+            print(f"✓ 长度验证通过: {len(decoded_text)} 字符")
+        
+        return decoded_text
+    
+    def save_decompressed(self, text: str, output_path: str):
+        """保存解压后的文本"""
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(text)
+        
+        print(f"\n✓ 解压文件已保存: {output_path}")
+
+
+# ============================================================================
+# 主程序
+# ============================================================================
+
+def main():
+    parser = argparse.ArgumentParser(description='文本 rANS 解码器')
+    parser.add_argument('-i', '--input', required=True, help='输入压缩文件 (.bin)')
+    parser.add_argument('-w', '--weights', required=True, help='H5权重文件')
+    parser.add_argument('-v', '--vocab', required=True, help='词表文件')
+    parser.add_argument('-o', '--output', required=True, help='输出文本文件')
+    
+    args = parser.parse_args()
+    
+    # 验证输入文件
+    if not Path(args.input).exists():
+        raise FileNotFoundError(f"压缩文件不存在: {args.input}")
+    if not Path(args.weights).exists():
+        raise FileNotFoundError(f"权重文件不存在: {args.weights}")
+    if not Path(args.vocab).exists():
+        raise FileNotFoundError(f"词表文件不存在: {args.vocab}")
+    
+    # 创建解压器
+    print("\n" + "="*70)
+    print("初始化解压器")
+    print("="*70)
+    decompressor = OptimizedTextDecompressor(args.weights, args.vocab)
+    
+    # 加载压缩文件
+    print("\n" + "="*70)
+    print("加载压缩文件")
+    print("="*70)
+    final_state, words, metadata = decompressor.load_compressed(args.input)
+    
+    # 解压
+    print("\n" + "="*70)
+    print("开始解压 (rANS)")
+    print("="*70)
+    decompressed_text = decompressor.decompress_text(final_state, words, metadata)
+    
+    # 保存
+    decompressor.save_decompressed(decompressed_text, args.output)
+    
+    # 打印统计
+    print(f"\n{'='*70}")
+    print(f"解压统计 (rANS)")
+    print(f"{'='*70}")
+    print(f"解压文本长度:    {len(decompressed_text):>12,} 字符")
+    print(f"解压文件大小:    {len(decompressed_text.encode('utf-8')):>12,} bytes")
+    print(f"{'='*70}\n")
+    
+    print("✓ 完成！")
+
+
+if __name__ == "__main__":
+    main()
