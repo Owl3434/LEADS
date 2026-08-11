@@ -1,0 +1,548 @@
+"""
+# ============================================================================
+# Range Asymmetric Numeral Systems (rANS)
+# ============================================================================
+#
+# This implementation is based on Asymmetric Numeral Systems (ANS) introduced by:
+#
+# J. Duda,
+# "Asymmetric Numeral Systems: Entropy Coding Combining Speed of Huffman
+# Coding with Compression Rate of Arithmetic Coding,"
+# arXiv:1311.2540, 2013.
+#
+# See also:
+# J. Duda, "Asymmetric Numeral Systems," arXiv:0902.0271, 2009.
+#
+# NOTE:
+# This code implements the range variant of ANS (rANS) directly.
+# Model probabilities are quantized into integer symbol frequencies and
+# used by the rANS state-transition and renormalization procedure.
+#
+# ============================================================================
+python DNA_image_decoder_rans.py -i compressed.bin -m /path/to/llama -w weights.bin -o output.png -p instruction
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from PIL import Image
+import struct
+import json
+import argparse
+from pathlib import Path
+from typing import List, Tuple, Dict
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+
+# ============================================================================
+# 配置
+# ============================================================================
+
+PATCH_SIZE = 16
+PIXELS_PER_PATCH = PATCH_SIZE * PATCH_SIZE * 3  # 768
+
+# rANS 参数 (从文件头读取，但定义默认值)
+RANS_L = 1 << 16  # L: 归一化下界 = 65536
+
+
+# ============================================================================
+# INT8 量化器
+# ============================================================================
+
+class INT8Quantizer:
+    """INT8对称量化"""
+    
+    @staticmethod
+    def dequantize(data: np.ndarray, scale: float) -> np.ndarray:
+        return data.astype(np.float32) * scale
+
+
+# ============================================================================
+# rANS 解码器 (严格按论文实现)
+# ============================================================================
+
+class RANSDecoder:
+    """
+    rANS 解码器
+    
+    解码公式 (Eq.2):
+        slot = x mod 2^n
+        找 s 使得 F(s) <= slot < F(s+1)
+        x' = f(s) * (x >> n) + slot - F(s)
+    
+    归一化 (Eq.4):
+        while x < L: x = (x << b) | next_word
+    """
+    
+    def __init__(self, initial_state: int, words: List[int], prob_bits: int, rans_b: int):
+        self.state = initial_state
+        self.words = words
+        self.pos = 0
+        self.prob_bits = prob_bits
+        self.prob_scale = 1 << prob_bits
+        self.rans_b = rans_b
+    
+    def decode_symbol(self, freqs: np.ndarray, cumul: np.ndarray) -> int:
+        """解码单个符号"""
+        # slot = x mod 2^n
+        slot = self.state & (self.prob_scale - 1)
+        
+        # 查找符号: F(s) <= slot < F(s+1)
+        symbol = 0
+        for i in range(len(cumul) - 1):
+            if cumul[i] <= slot < cumul[i + 1]:
+                symbol = i
+                break
+        
+        freq = int(freqs[symbol])
+        start = int(cumul[symbol])  # F(s)
+        
+        # 解码 (Eq.2): x' = f(s) * (x >> n) + slot - F(s)
+        self.state = freq * (self.state >> self.prob_bits) + slot - start
+        
+        # 归一化 (Eq.4): while x < L
+        while self.state < RANS_L and self.pos < len(self.words):
+            self.state = (self.state << self.rans_b) | self.words[self.pos]
+            self.pos += 1
+        
+        return symbol
+
+
+def quantize_pdf(pdf: np.ndarray, prob_scale: int) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    量化概率分布（必须与编码器完全一致）
+    """
+    n = len(pdf)
+    
+    pdf = np.asarray(pdf, dtype=np.float64)
+    pdf = np.maximum(pdf, 1e-10)
+    pdf = pdf / pdf.sum()
+    
+    freqs = np.floor(pdf * prob_scale).astype(np.int64)
+    freqs = np.maximum(freqs, 1)
+    
+    current_sum = freqs.sum()
+    diff = prob_scale - current_sum
+    
+    if diff > 0:
+        idx = np.argmax(pdf)
+        freqs[idx] += diff
+    elif diff < 0:
+        diff = -diff
+        sorted_idx = np.argsort(freqs)[::-1]
+        for idx in sorted_idx:
+            if freqs[idx] > 1:
+                can_take = min(freqs[idx] - 1, diff)
+                freqs[idx] -= can_take
+                diff -= can_take
+                if diff == 0:
+                    break
+    
+    cumul = np.zeros(n + 1, dtype=np.int64)
+    cumul[1:] = np.cumsum(freqs)
+    
+    if cumul[-1] != prob_scale:
+        freqs[-1] += prob_scale - cumul[-1]
+        cumul[1:] = np.cumsum(freqs)
+    
+    return freqs, cumul
+
+
+# ============================================================================
+# IA3-Llama 模型 (与编码器相同)
+# ============================================================================
+
+class IA3LlamaModel(nn.Module):
+    """IA3-Llama模型"""
+    
+    def __init__(self, model_path: str, ia3_weights_path: str, device: str = "cuda"):
+        super().__init__()
+        self.model_path = model_path
+        self.device = torch.device(device if torch.cuda.is_available() else "cpu")
+        
+        print(f"加载基础模型: {model_path}")
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=torch.float16,
+            device_map={"": self.device},
+            trust_remote_code=True
+        )
+        
+        config = self.model.config
+        self.num_layers = config.num_hidden_layers
+        self.hidden_dim = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        self.num_attention_heads = config.num_attention_heads
+        self.num_key_value_heads = getattr(config, 'num_key_value_heads', self.num_attention_heads)
+        self.head_dim = self.hidden_dim // self.num_attention_heads
+        self.kv_dim = self.head_dim * self.num_key_value_heads
+        
+        for param in self.model.parameters():
+            param.requires_grad = False
+        
+        self.ia3_parameters = {}
+        
+        print(f"加载IA3权重: {ia3_weights_path}")
+        self._load_ia3_weights(ia3_weights_path)
+        
+        self.model.eval()
+        print("模型初始化完成")
+    
+    def _load_ia3_weights(self, weights_path: str):
+        weights_path = Path(weights_path)
+        
+        if self._try_load_self_contained_bin(weights_path):
+            return
+        
+        base_path = weights_path.with_suffix('')
+        metadata_path = f"{base_path}_metadata.json"
+        
+        if Path(metadata_path).exists():
+            self._load_legacy_format(base_path)
+        else:
+            raise FileNotFoundError(f"无法加载权重")
+    
+    def _try_load_self_contained_bin(self, bin_path: Path) -> bool:
+        try:
+            with open(bin_path, 'rb') as f:
+                magic = struct.unpack('<I', f.read(4))[0]
+                if magic != 0x49413333:
+                    return False
+                
+                num_params = struct.unpack('<I', f.read(4))[0]
+                expected_params = self.num_layers * 3
+                
+                if num_params != expected_params:
+                    return False
+                
+                scales = []
+                for _ in range(num_params):
+                    scale = struct.unpack('<f', f.read(4))[0]
+                    scales.append(scale)
+                
+                binary_data = f.read()
+            
+            param_idx = 0
+            offset = 0
+            
+            for layer_idx in range(self.num_layers):
+                for module_name in ["k_proj", "v_proj", "up_proj"]:
+                    param_name = f"layer_{layer_idx}_{module_name}"
+                    
+                    if module_name in ["k_proj", "v_proj"]:
+                        size = self.kv_dim
+                    else:
+                        size = self.intermediate_size
+                    
+                    chunk = binary_data[offset:offset + size]
+                    q_data = np.frombuffer(chunk, dtype=np.int8)
+                    offset += size
+                    
+                    scale = scales[param_idx]
+                    fp_data = INT8Quantizer.dequantize(q_data, scale)
+                    
+                    param_tensor = torch.from_numpy(fp_data).to(
+                        dtype=torch.float16,
+                        device=self.device
+                    )
+                    
+                    self.ia3_parameters[param_name] = param_tensor
+                    param_idx += 1
+            
+            print(f"加载了 {len(self.ia3_parameters)} 个IA3参数")
+            self._register_ia3_hooks()
+            return True
+            
+        except Exception:
+            return False
+    
+    def _load_legacy_format(self, base_path: Path):
+        metadata_path = f"{base_path}_metadata.json"
+        
+        with open(metadata_path, 'r') as f:
+            metadata = json.load(f)
+        
+        param_order = metadata['parameter_order']
+        param_info = metadata['parameter_info']
+        
+        bin_path = f"{base_path}.bin"
+        with open(bin_path, 'rb') as f:
+            binary_data = f.read()
+        
+        offset = 0
+        for param_name in param_order:
+            info = param_info[param_name]
+            shape = info['shape']
+            size = info['size']
+            scale = info['scale']
+            
+            chunk = binary_data[offset:offset + size]
+            q_data = np.frombuffer(chunk, dtype=np.int8)
+            offset += size
+            
+            fp_data = INT8Quantizer.dequantize(q_data, scale)
+            fp_data = fp_data.reshape(shape)
+            
+            param_tensor = torch.from_numpy(fp_data).to(
+                dtype=torch.float16,
+                device=self.device
+            )
+            
+            self.ia3_parameters[param_name] = param_tensor
+        
+        print(f"加载了 {len(self.ia3_parameters)} 个IA3参数")
+        self._register_ia3_hooks()
+    
+    def _register_ia3_hooks(self):
+        for layer_idx, layer in enumerate(self.model.model.layers):
+            for module_name in ["k_proj", "v_proj", "up_proj"]:
+                param_name = f"layer_{layer_idx}_{module_name}"
+                
+                if param_name not in self.ia3_parameters:
+                    continue
+                
+                if module_name == "k_proj":
+                    target_module = layer.self_attn.k_proj
+                elif module_name == "v_proj":
+                    target_module = layer.self_attn.v_proj
+                elif module_name == "up_proj":
+                    target_module = layer.mlp.up_proj
+                
+                ia3_param = self.ia3_parameters[param_name]
+                
+                def make_hook(param):
+                    def hook(module, input, output):
+                        return output * param
+                    return hook
+                
+                target_module.register_forward_hook(make_hook(ia3_param))
+    
+    def forward(self, input_ids, attention_mask=None):
+        return self.model(input_ids=input_ids, attention_mask=attention_mask)
+
+
+# ============================================================================
+# DNA 解压缩解码器 (rANS 版本)
+# ============================================================================
+
+class DNADecoder:
+    """DNA无损图像解压缩解码器（rANS版本）"""
+    
+    def __init__(self, model_path: str, ia3_weights_path: str, prompt_type: str = "instruction"):
+        print("="*70)
+        print("DNA 无损图像解压缩解码器 (rANS 版本)")
+        print("="*70)
+        print(f"Prompt类型: {prompt_type}")
+        
+        self.model = IA3LlamaModel(model_path, ia3_weights_path)
+        self.prompt_type = prompt_type
+        
+        print(f"加载tokenizer: {model_path}")
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_path, 
+            trust_remote_code=True,
+            use_fast=True
+        )
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+        if self.tokenizer.bos_token_id is None:
+            self.tokenizer.bos_token_id = 128000
+        
+        print("构建数字词表...")
+        self.digital_dict = {}
+        self.reverse_dict = {}
+        for i in range(256):
+            tokens = self.tokenizer.encode(str(i), add_special_tokens=False)
+            if len(tokens) != 1:
+                raise ValueError(f"数字 {i} 映射到 {len(tokens)} 个tokens")
+            token_id = tokens[0]
+            self.digital_dict[i] = token_id
+            self.reverse_dict[token_id] = i
+        
+        print(f"词表构建完成: 0-255 → {len(self.digital_dict)} tokens")
+        print("解码器初始化完成\n")
+    
+    def generate_prompt_tokens(self, x: int, y: int, img_width: int, img_height: int) -> List[int]:
+        if self.prompt_type == "no_prompt":
+            return [self.tokenizer.bos_token_id]
+        elif self.prompt_type == "channel":
+            prompt = "Every triplet denote an RGB pixel of a 2D image. Predict the next RGB pixel based on the previous pixels."
+            return [self.tokenizer.bos_token_id] + self.tokenizer.encode(prompt, add_special_tokens=False)
+        else:
+            prompt = f"At position ({x:04d}, {y:04d}) begins a sequence where every triplet denotes an RGB pixel of a 2D image. Predict the next RGB pixel based on the previous pixels."
+            return [self.tokenizer.bos_token_id] + self.tokenizer.encode(prompt, add_special_tokens=False)
+    
+    def get_pixel_probability(self, context_tokens: List[int]) -> np.ndarray:
+        device = self.model.device
+        context = torch.tensor(context_tokens, dtype=torch.long).unsqueeze(0).to(device)
+        
+        with torch.no_grad():
+            outputs = self.model(context)
+            logits = outputs.logits[0, -1, :]
+            full_probs = torch.softmax(logits, dim=0)
+            
+            pixel_probs = torch.zeros(256, device=device, dtype=torch.float32)
+            for pixel_val in range(256):
+                token_id = self.digital_dict[pixel_val]
+                pixel_probs[pixel_val] = full_probs[token_id]
+        
+        return pixel_probs.cpu().numpy()
+    
+    def decompress_patch(self, final_state: int, words: List[int],
+                        x: int, y: int, img_width: int, img_height: int,
+                        prob_bits: int, rans_b: int) -> np.ndarray:
+        """
+        解压一个patch
+        
+        Returns:
+            解压后的像素数组 (768,)
+        """
+        prob_scale = 1 << prob_bits
+        
+        # 初始化解码器
+        decoder = RANSDecoder(final_state, words, prob_bits, rans_b)
+        
+        # 生成提示词tokens
+        prompt_tokens = self.generate_prompt_tokens(x, y, img_width, img_height)
+        context_tokens = prompt_tokens.copy()
+        
+        # 逐像素解码
+        pixels = []
+        for _ in range(PIXELS_PER_PATCH):
+            # 获取概率分布（与编码器完全相同）
+            prob_dist = self.get_pixel_probability(context_tokens)
+            freqs, cumul = quantize_pdf(prob_dist, prob_scale)
+            
+            # 解码
+            pixel_val = decoder.decode_symbol(freqs, cumul)
+            
+            if pixel_val < 0 or pixel_val > 255:
+                raise ValueError(f"无效像素值: {pixel_val}")
+            
+            pixels.append(pixel_val)
+            
+            # 更新context
+            pixel_token = self.digital_dict[pixel_val]
+            context_tokens.append(pixel_token)
+        
+        return np.array(pixels, dtype=np.uint8)
+    
+    def decompress_image(self, input_path: str, output_path: str):
+        """解压完整图像"""
+        print(f"读取压缩文件: {input_path}")
+        
+        # 读取文件头
+        with open(input_path, 'rb') as f:
+            magic = struct.unpack('<I', f.read(4))[0]
+            if magic != 0x524E5331:  # 'RNS1'
+                raise ValueError(f"无效文件格式 (magic: 0x{magic:08X})")
+            
+            original_width = struct.unpack('<I', f.read(4))[0]
+            original_height = struct.unpack('<I', f.read(4))[0]
+            padded_width = struct.unpack('<I', f.read(4))[0]
+            padded_height = struct.unpack('<I', f.read(4))[0]
+            num_patches = struct.unpack('<I', f.read(4))[0]
+            prob_bits = struct.unpack('<B', f.read(1))[0]
+            rans_b = struct.unpack('<B', f.read(1))[0]
+            
+            print(f"原始尺寸: {original_width}x{original_height}")
+            print(f"Padded尺寸: {padded_width}x{padded_height}")
+            print(f"Patches: {num_patches}")
+            print(f"rANS参数: n={prob_bits}, b={rans_b}")
+            
+            # 读取 patch info
+            patch_states = []
+            patch_num_words = []
+            for _ in range(num_patches):
+                state = struct.unpack('<Q', f.read(8))[0]
+                num_words = struct.unpack('<I', f.read(4))[0]
+                patch_states.append(state)
+                patch_num_words.append(num_words)
+            
+            # 读取压缩数据
+            all_patch_words = []
+            for num_words in patch_num_words:
+                words = []
+                for _ in range(num_words):
+                    w = struct.unpack('<H', f.read(2))[0]
+                    words.append(w)
+                all_patch_words.append(words)
+        
+        n_h = padded_height // PATCH_SIZE
+        n_w = padded_width // PATCH_SIZE
+        
+        print(f"\n开始解压 (rANS)...\n")
+        
+        # 重建图像
+        img_array = np.zeros((padded_height, padded_width, 3), dtype=np.uint8)
+        
+        for patch_idx in range(num_patches):
+            i = patch_idx // n_w
+            j = patch_idx % n_w
+            x = j * PATCH_SIZE
+            y = i * PATCH_SIZE
+            
+            print(f"Patch [{i},{j}] (第{patch_idx+1}/{num_patches}个)", end=" ")
+            
+            # 解压
+            pixels = self.decompress_patch(
+                patch_states[patch_idx],
+                all_patch_words[patch_idx],
+                x, y, padded_width, padded_height,
+                prob_bits, rans_b
+            )
+            
+            # 重建patch
+            patch = pixels.reshape(PATCH_SIZE, PATCH_SIZE, 3)
+            img_array[
+                i*PATCH_SIZE:(i+1)*PATCH_SIZE,
+                j*PATCH_SIZE:(j+1)*PATCH_SIZE,
+                :
+            ] = patch
+            
+            print("✓")
+        
+        # 裁剪到原始尺寸
+        img_array = img_array[:original_height, :original_width, :]
+        
+        # 保存
+        img = Image.fromarray(img_array, mode='RGB')
+        img.save(output_path)
+        
+        print(f"\n解压完成: {output_path}")
+        print(f"尺寸: {original_width}x{original_height}")
+
+
+# ============================================================================
+# 主程序
+# ============================================================================
+
+def main():
+    parser = argparse.ArgumentParser(description='DNA 无损图像解压缩解码器 (rANS 版本)')
+    parser.add_argument('-i', '--input', required=True, help='输入压缩文件路径')
+    parser.add_argument('-m', '--model', required=True, help='基础Llama模型路径')
+    parser.add_argument('-w', '--weights', required=True, help='IA3权重文件路径')
+    parser.add_argument('-o', '--output', required=True, help='输出图片路径')
+    parser.add_argument('-p', '--prompt', default='instruction', 
+                       choices=['no_prompt', 'channel', 'instruction'],
+                       help='提示词类型')
+    
+    args = parser.parse_args()
+    
+    if not Path(args.input).exists():
+        raise FileNotFoundError(f"压缩文件不存在: {args.input}")
+    if not Path(args.model).exists():
+        raise FileNotFoundError(f"模型不存在: {args.model}")
+    if not Path(args.weights).exists():
+        raise FileNotFoundError(f"权重不存在: {args.weights}")
+    
+    decoder = DNADecoder(args.model, args.weights, args.prompt)
+    decoder.decompress_image(args.input, args.output)
+    
+    print("解压完成!")
+
+
+if __name__ == "__main__":
+    main()
